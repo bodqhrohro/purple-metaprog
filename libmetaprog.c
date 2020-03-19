@@ -35,6 +35,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #endif
 
 #define SERVER_ADDRESS "server-address"
+#define SERVER_PORT "server-port"
 
 
 
@@ -238,6 +239,9 @@ plugin_init(PurplePlugin *plugin)
 	PurpleAccountOption *opt;
 
 	opt = purple_account_option_string_new(_("Server address"), SERVER_ADDRESS, NULL);
+	prpl_info->protocol_options = g_list_append(prpl_info->protocol_options, opt);
+
+	opt = purple_account_option_int_new(_("Server port"), SERVER_PORT, 9090);
 	prpl_info->protocol_options = g_list_append(prpl_info->protocol_options, opt);
 
 	info = plugin->info;
