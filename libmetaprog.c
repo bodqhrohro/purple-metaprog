@@ -80,7 +80,7 @@ typedef struct {
 	GThread *read_thread;
 
 	guchar *auth_string;
-	size_t *auth_string_len;
+	size_t auth_string_len;
 } MetaprogAccount;
 
 
@@ -224,7 +224,7 @@ metaprog_socket_read_callback(gpointer user_data, gint fd, PurpleInputCondition 
 }
 */
 
-static void
+static gpointer
 metaprog_socket_read_loop(gpointer user_data)
 {
 	gssize size;
@@ -236,7 +236,7 @@ metaprog_socket_read_loop(gpointer user_data)
 	struct pollfd fds[1] = { fd, POLLIN, 0 };
 
 	for (;;) {
-		if (ma->connection_closed) return;
+		if (ma->connection_closed) return NULL;
 
 		usleep(POLL_INTERVAL);
 		poll(fds, 1, POLL_TIMEOUT);
@@ -283,13 +283,15 @@ metaprog_socket_read_loop(gpointer user_data)
 			purple_debug_error("metaprog", "errno = %d\n", errno);
 		}
 	}
+
+	return NULL;
 }
 
 static void
 metaprog_auth_string(MetaprogAccount *ma)
 {
-	char *username = purple_account_get_username(ma->account);
-	char *password = purple_account_get_password(ma->account);
+	const char *username = purple_account_get_username(ma->account);
+	const char *password = purple_account_get_password(ma->account);
 
 	guint32 username_len = (guint32)(strlen(username));
 	guint32 password_len = (guint32)(strlen(password));
@@ -345,7 +347,7 @@ metaprog_socket_connect_callback(PurpleSocket *ps, const gchar *error, gpointer 
 static void
 metaprog_session_start(MetaprogAccount *ma)
 {
-	char *host = purple_account_get_string(ma->account, SERVER_ADDRESS, NULL);
+	const char *host = purple_account_get_string(ma->account, SERVER_ADDRESS, NULL);
 	int port = purple_account_get_int(ma->account, SERVER_PORT, 0);
 
 	if (!g_strcmp0(host, "") || host == NULL) {

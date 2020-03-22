@@ -1,7 +1,7 @@
 
 PKG_CONFIG ?= pkg-config
 
-CFLAGS	?= -O2 -g -pipe
+CFLAGS	?= -O2 -g -pipe -Wno-deprecated-declarations
 LDFLAGS ?= 
 
 # Windoze support is not needed, because I can!
