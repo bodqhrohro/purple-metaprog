@@ -46,10 +46,13 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #define POLL_INTERVAL 10000
 #define POLL_TIMEOUT 60
 
-#define METAPROG_CONNECTION_STATE_FAILURE 1
-#define METAPROG_CONNECTION_STATE_WRONG_PASSWORD 2
-#define METAPROG_CONNECTION_STATE_USER_NOT_FOUND 6
-#define METAPROG_CONNECTION_STATE_CONNECTED 7
+enum METAPROG_CONNECTION
+{
+	METAPROG_CONNECTION_STATE_FAILURE = 1,
+	METAPROG_CONNECTION_STATE_WRONG_PASSWORD = 2,
+	METAPROG_CONNECTION_STATE_USER_NOT_FOUND = 6,
+	METAPROG_CONNECTION_STATE_CONNECTED = 7
+};
 
 
 static guchar*
@@ -246,7 +249,7 @@ metaprog_socket_read_loop(gpointer user_data)
 			if (size == 10) {
 				gboolean known_auth = TRUE;
 
-				guint32 auth_result = metaprog_char_to_guint32(buf + 6);
+				enum METAPROG_CONNECTION auth_result = (int)metaprog_char_to_guint32(buf + 6);
 
 				switch (auth_result) {
 				case METAPROG_CONNECTION_STATE_FAILURE:
