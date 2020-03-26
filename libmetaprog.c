@@ -20,6 +20,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 
 #include <glib.h>
+#include <gmodule.h>
 #include <purple.h>
 #include <string.h>
 #include <unistd.h>
@@ -54,6 +55,13 @@ enum METAPROG_CONNECTION
 	METAPROG_CONNECTION_STATE_CONNECTED = 7
 };
 
+enum METAPROG_CMD
+{
+	METAPROG_CMD_PROBE = 0,
+	METAPROG_CMD_AUTH_SUCCESS = 3,
+	METAPROG_CMD_REQUEST_CHATS = 10,
+};
+
 
 static guchar*
 metaprog_guint32_to_char(guchar* offset, guint32 src)
@@ -78,13 +86,21 @@ typedef struct {
 	PurpleConnection *pc;
 	PurpleSocket *socket;
 
+	const char *host;
+	int port;
+
+	GQueue *cmd_queue;
 	gboolean connection_closed;
 	guint32 connection_state;
-	GThread *read_thread;
 
 	guchar *auth_string;
 	size_t auth_string_len;
 } MetaprogAccount;
+
+typedef struct {
+	enum METAPROG_CMD cmd;
+	char *payload;
+} MetaprogCmdObject;
 
 
 
@@ -207,87 +223,13 @@ metaprog_get_chat_history(MetaprogAccount *ia, const gchar* chatId, const gchar*
 {
 }*/
 
-/*
 static void
-metaprog_socket_read_callback(gpointer user_data, gint fd, PurpleInputCondition cond)
+metaprog_send_cmd(enum METAPROG_CMD cmd, MetaprogAccount *ma)
 {
-	gssize size;
-	guchar buf[BUF_SIZE];
+	MetaprogCmdObject *co = g_new0(MetaprogCmdObject, 1);
+	co->cmd = cmd;
 
-	PurpleSocket *socket = user_data;
-
-	while ((size = purple_socket_read(socket, buf, BUF_SIZE - 1)) > 0) {
-		buf[size] = 0;
-		purple_debug_warning("metaprog", "buf = %d\n", size);
-	}
-
-	if (size < 0 && errno != EAGAIN) {
-		purple_debug_error("metaprog", "errno = %d\n", errno);
-	}
-}
-*/
-
-static gpointer
-metaprog_socket_read_loop(gpointer user_data)
-{
-	gssize size;
-	guchar buf[BUF_SIZE];
-
-	MetaprogAccount *ma = user_data;
-
-	int fd = purple_socket_get_fd(ma->socket);
-	struct pollfd fds[1] = { fd, POLLIN, 0 };
-
-	for (;;) {
-		if (ma->connection_closed) return NULL;
-
-		usleep(POLL_INTERVAL);
-		poll(fds, 1, POLL_TIMEOUT);
-
-		while ((size = purple_socket_read(ma->socket, buf, BUF_SIZE)) > 0) {
-			// looks like auth result
-			if (size == 10) {
-				gboolean known_auth = TRUE;
-
-				enum METAPROG_CONNECTION auth_result = (int)metaprog_char_to_guint32(buf + 6);
-
-				switch (auth_result) {
-				case METAPROG_CONNECTION_STATE_FAILURE:
-					purple_connection_error(ma->pc, PURPLE_CONNECTION_ERROR_AUTHENTICATION_FAILED, _("Generic authentication error (0x01)"));
-				break;
-				case METAPROG_CONNECTION_STATE_WRONG_PASSWORD:
-					purple_connection_error(ma->pc, PURPLE_CONNECTION_ERROR_AUTHENTICATION_FAILED, _("Wrong password"));
-				break;
-				case METAPROG_CONNECTION_STATE_USER_NOT_FOUND:
-					purple_connection_error(ma->pc, PURPLE_CONNECTION_ERROR_INVALID_USERNAME, _("User not found"));
-				break;
-				case METAPROG_CONNECTION_STATE_CONNECTED:
-					// noop, authenticated successfully
-				break;
-				default:
-					known_auth = FALSE;
-				break;
-				}
-
-				purple_debug_info("metaprog", "auth_result = %d\n", auth_result);
-
-				if (known_auth) {
-					continue;
-				}
-			}
-
-			purple_debug_error("metaprog", "Unknown incoming data, please report this to developers:");
-			for (int i = 0; i < size; i ++) {
-				purple_debug_error("metaprog", "buf[%d] = %x\n", i, buf[i]);
-			}
-		}
-
-		if (size < 0 && errno != EAGAIN) {
-			purple_debug_error("metaprog", "errno = %d\n", errno);
-		}
-	}
-
-	return NULL;
+	g_queue_push_head(ma->cmd_queue, co);
 }
 
 static void
@@ -319,16 +261,7 @@ metaprog_auth_string(MetaprogAccount *ma)
 	}*/
 }
 
-static void
-metaprog_socket_probe(MetaprogAccount *ma)
-{
-	gssize size;
-	size = purple_socket_write(ma->socket, ma->auth_string, ma->auth_string_len);
-
-	if (size != ma->auth_string_len) {
-		purple_debug_warning("metaprog", "The socket have choked! Feed it carefully!\n");
-	}
-}
+static void metaprog_socket_init(MetaprogAccount *ma);
 
 static void
 metaprog_socket_connect_callback(PurpleSocket *ps, const gchar *error, gpointer user_data)
@@ -341,31 +274,137 @@ metaprog_socket_connect_callback(PurpleSocket *ps, const gchar *error, gpointer 
 
 	MetaprogAccount *ma = user_data;
 
-	// purple_socket_watch(ps, PURPLE_INPUT_READ, metaprog_socket_read_callback, ps);
-	ma->read_thread = g_thread_new("mtprg-sk-read", metaprog_socket_read_loop, ma);
+	MetaprogCmdObject *co;
 
-	metaprog_socket_probe(ma);
+	// wait for the command
+	for (;;) {
+		if (ma->connection_closed) return;
+
+		co = g_queue_pop_tail(ma->cmd_queue);
+
+		if (co != NULL) break;
+
+		usleep(POLL_INTERVAL);
+	}
+
+	gssize size;
+
+	// send command
+	char *cmd_string = (char*)g_memdup(ma->auth_string, ma->auth_string_len);
+	cmd_string[9] = co->cmd & 0xff;
+
+	size = purple_socket_write(ps, cmd_string, ma->auth_string_len);
+
+	if (size != ma->auth_string_len) {
+		if (size == -1) {
+			purple_debug_error("metaprog", "Socket write error: %d\n", errno);
+		} else {
+			purple_debug_error("metaprog", "The socket has choked! Feed it carefully! %d %d\n", size, ma->auth_string_len);
+		}
+	}
+
+	g_free(cmd_string);
+
+	// process the response
+	guchar buf[BUF_SIZE];
+	gboolean read_finished = FALSE;
+
+	int fd = purple_socket_get_fd(ps);
+	struct pollfd fds[1] = { fd, POLLIN, 0 };
+
+	for (;;) {
+		while ((size = purple_socket_read(ps, buf, BUF_SIZE)) > 0) {
+			// looks like auth result
+			if (size == 10) {
+				gboolean known_auth = TRUE;
+
+				enum METAPROG_CONNECTION auth_result = (int)metaprog_char_to_guint32(buf + 6);
+
+				switch (auth_result) {
+				case METAPROG_CONNECTION_STATE_FAILURE:
+					purple_connection_error(ma->pc, PURPLE_CONNECTION_ERROR_AUTHENTICATION_FAILED, _("Generic authentication error (0x01)"));
+				break;
+				case METAPROG_CONNECTION_STATE_WRONG_PASSWORD:
+					purple_connection_error(ma->pc, PURPLE_CONNECTION_ERROR_AUTHENTICATION_FAILED, _("Wrong password"));
+				break;
+				case METAPROG_CONNECTION_STATE_USER_NOT_FOUND:
+					purple_connection_error(ma->pc, PURPLE_CONNECTION_ERROR_INVALID_USERNAME, _("User not found"));
+				break;
+				case METAPROG_CONNECTION_STATE_CONNECTED:
+					// noop, authenticated successfully
+				break;
+				default:
+					known_auth = FALSE;
+				break;
+				}
+
+				purple_debug_info("metaprog", "auth_result = %d\n", auth_result);
+
+				if (known_auth) {
+					metaprog_send_cmd(METAPROG_CMD_AUTH_SUCCESS, ma);
+					metaprog_send_cmd(METAPROG_CMD_REQUEST_CHATS, ma);
+					read_finished = TRUE;
+					break;
+				}
+			}
+
+			purple_debug_error("metaprog", "Unknown incoming data, please report this to developers:");
+			for (int i = 0; i < size; i ++) {
+				purple_debug_error("metaprog", "buf[%d] = %x\n", i, buf[i]);
+			}
+		}
+
+		if (read_finished) break;
+
+		if (size < 0 && errno != EAGAIN) {
+			purple_debug_error("metaprog", "errno = %d\n", errno);
+			break;
+		}
+
+		usleep(POLL_INTERVAL);
+		poll(fds, 1, POLL_TIMEOUT);
+
+		if (ma->connection_closed) return;
+	}
+
+	if (!ma->connection_closed) {
+		// reopen the socket for the next command
+		purple_socket_destroy(ps);
+		PurpleConnection *pc = purple_account_get_connection(ma->account);
+		ma->socket = purple_socket_new(pc);
+		metaprog_socket_init(ma);
+
+		g_free(co->payload);
+		g_free(co);
+	}
+}
+
+static void
+metaprog_socket_init(MetaprogAccount *ma) {
+	purple_socket_set_host(ma->socket, ma->host);
+	purple_socket_set_port(ma->socket, ma->port);
+
+	purple_socket_connect(ma->socket, metaprog_socket_connect_callback, ma);
 }
 
 static void
 metaprog_session_start(MetaprogAccount *ma)
 {
-	const char *host = purple_account_get_string(ma->account, SERVER_ADDRESS, NULL);
-	int port = purple_account_get_int(ma->account, SERVER_PORT, 0);
+	ma->host = purple_account_get_string(ma->account, SERVER_ADDRESS, NULL);
+	ma->port = purple_account_get_int(ma->account, SERVER_PORT, 0);
 
-	if (!g_strcmp0(host, "") || host == NULL) {
+	if (!g_strcmp0(ma->host, "") || ma->host == NULL) {
 		purple_connection_error(ma->pc, PURPLE_CONNECTION_ERROR_AUTHENTICATION_FAILED, "No server address specified");
 		return;
 	}
-	if (port < 0 || port > 0xffff) {
+	if (ma->port < 0 || ma->port > 0xffff) {
 		purple_connection_error(ma->pc, PURPLE_CONNECTION_ERROR_AUTHENTICATION_FAILED, "Wrong port specified");
 		return;
 	}
 
-	purple_socket_set_host(ma->socket, host);
-	purple_socket_set_port(ma->socket, port);
+	metaprog_send_cmd(METAPROG_CMD_PROBE, ma);
 
-	purple_socket_connect(ma->socket, metaprog_socket_connect_callback, ma);
+	metaprog_socket_init(ma);
 }
 
 static void
@@ -380,6 +419,7 @@ metaprog_login(PurpleAccount *account)
 	ma->pc = pc;
 
 	ma->socket = purple_socket_new(pc);
+	ma->cmd_queue =	g_queue_new();
 
 	ma->connection_closed = FALSE;
 
@@ -400,9 +440,12 @@ metaprog_close(PurpleConnection *pc)
 
 	ma->connection_closed = TRUE;
 
-	if (ma->read_thread != NULL) {
-		g_thread_join(ma->read_thread);
+	MetaprogCmdObject *co;
+	while ((co = g_queue_pop_tail(ma->cmd_queue)) != NULL) {
+		g_free(co->payload);
+		g_free(co);
 	}
+	g_queue_free(ma->cmd_queue);
 
 	purple_socket_destroy(ma->socket);
 	
