@@ -58,8 +58,8 @@ enum METAPROG_CONNECTION
 enum METAPROG_CMD
 {
 	METAPROG_CMD_PROBE = 0,
-	METAPROG_CMD_AUTH_SUCCESS = 3,
-	METAPROG_CMD_REQUEST_CHATS = 10,
+	METAPROG_CMD_REQUEST_CHATS = 3,
+	//METAPROG_CMD_REQUEST_CHATS = 10,
 };
 
 
@@ -85,6 +85,7 @@ typedef struct {
 	PurpleAccount *account;
 	PurpleConnection *pc;
 	PurpleSocket *socket;
+	PurpleGroup *default_group;
 
 	const char *host;
 	int port;
@@ -95,6 +96,8 @@ typedef struct {
 
 	guchar *auth_string;
 	size_t auth_string_len;
+
+	GHashTable *chats_list;
 } MetaprogAccount;
 
 typedef struct {
@@ -104,10 +107,85 @@ typedef struct {
 
 
 
+/*static void
+metaprog_util_free_gchar(gpointer data)
+{
+	gchar *ch = data;
+	g_free(ch);
+}*/
+
+
+
+static PurpleGroup*
+metaprog_get_or_create_default_group(const gchar *group_name)
+{
+	if (group_name == NULL) {
+		group_name = "Metaprog Online";
+	}
+
+	PurpleGroup *metaprog_group = purple_blist_find_group(group_name);
+
+	if (!metaprog_group) {
+		metaprog_group = purple_group_new(group_name);
+		purple_blist_add_group(metaprog_group, NULL);
+	}
+
+	return metaprog_group;
+}
+
 static const char *
 metaprog_list_icon(PurpleAccount *account, PurpleBuddy *buddy)
 {
 	return "metaprog";
+}
+
+static GList *
+metaprog_chat_info(PurpleConnection *pc)
+{
+	GList *m = NULL;
+	PurpleProtocolChatEntry *pce;
+
+	pce = g_new0(PurpleProtocolChatEntry, 1);
+	pce->label = _("Chat ID");
+	pce->identifier = "id";
+	pce->required = TRUE;
+	m = g_list_append(m, pce);
+
+	pce = g_new0(PurpleProtocolChatEntry, 1);
+	pce->label = _("Chat name");
+	pce->identifier = "name";
+	pce->required = TRUE;
+	m = g_list_append(m, pce);
+
+	return m;
+}
+
+static GHashTable *
+metaprog_chat_info_new(PurpleConnection *pc, guint32 id, const char* name)
+{
+	GHashTable *ht = g_hash_table_new_full(g_str_hash, g_str_equal, NULL, g_free);
+
+	g_hash_table_insert(ht, "id", g_strdup_printf("%d", id));
+	if (name != NULL)
+	{
+		g_hash_table_insert(ht, "name", g_strdup(name));
+	}
+
+	return ht;
+}
+
+static GHashTable *
+metaprog_chat_info_defaults(PurpleConnection *pc, const char *chatname)
+{
+	GHashTable *defaults = g_hash_table_new_full(g_str_hash, g_str_equal, NULL, g_free);
+
+	g_hash_table_insert(defaults, "id", "0");
+	if (chatname != NULL)
+	{
+		g_hash_table_insert(defaults, "name", g_strdup(chatname));
+	}
+
+	return defaults;
 }
 
 static GList *
@@ -164,7 +242,7 @@ metaprog_get_chat_name(GHashTable *data)
 	if (data == NULL)
 		return NULL;
 	
-	temp = g_hash_table_lookup(data, "sn");
+	temp = g_hash_table_lookup(data, "name");
 
 	if (temp == NULL)
 		return NULL;
@@ -264,6 +342,65 @@ metaprog_auth_string(MetaprogAccount *ma)
 static void metaprog_socket_init(MetaprogAccount *ma);
 
 static void
+metaprog_populate_buddy_list(gpointer key, gpointer value, gpointer user_data)
+{
+	guint32 id = GPOINTER_TO_UINT(key);
+	gchar *name = value;
+	MetaprogAccount *ma = user_data;
+
+	char *string_id = g_strdup_printf("%d", id);
+
+	PurpleChat *chat = purple_blist_find_chat(ma->account, string_id);
+
+	if (chat == NULL) {
+		chat = purple_chat_new(ma->account, name, metaprog_chat_info_new(ma->pc, id, name));
+
+		purple_blist_add_chat(chat, ma->default_group, NULL);
+	}
+
+	g_free(string_id);
+}
+
+static void
+metaprog_socket_read_chats_list(guchar *buf, gssize size, MetaprogAccount *ma, GError **error)
+{
+	if (size < 8) return;
+
+	guint32 chat_count = metaprog_char_to_guint32(buf + 4);
+
+	guint offset = 8;
+
+	guint32 chat_id;
+	guint32 name_length;
+	gchar *name;
+
+	for (int i = 0; i < chat_count; i ++) {
+		if (offset + 12 > size) break;
+
+		chat_id = metaprog_char_to_guint32(buf + offset);
+		name_length = metaprog_char_to_guint32(buf + offset + 8);
+
+		offset += 12;
+
+		if (offset + name_length > size) break;
+
+		name = g_convert(buf + offset, name_length, "UTF-8", "Cp1251", NULL, NULL, error);
+		if ((*error) != NULL) {
+			break;
+		}
+
+		g_hash_table_insert(ma->chats_list, GUINT_TO_POINTER(chat_id), name);
+		offset += name_length;
+	}
+
+	// TODO: fetch next chunks if all chats don't fit in one buffer
+	/*while ((size = purple_socket_read(ma->socket, buf, BUF_SIZE)) > 0) {
+	}*/
+
+	g_hash_table_foreach(ma->chats_list, metaprog_populate_buddy_list, ma);
+}
+
+static void
 metaprog_socket_connect_callback(PurpleSocket *ps, const gchar *error, gpointer user_data)
 {
 	if (error != NULL) {
@@ -308,6 +445,7 @@ metaprog_socket_connect_callback(PurpleSocket *ps, const gchar *error, gpointer 
 	// process the response
 	guchar buf[BUF_SIZE];
 	gboolean read_finished = FALSE;
+	gboolean last_cmd = FALSE;
 
 	int fd = purple_socket_get_fd(ps);
 	struct pollfd fds[1] = { fd, POLLIN, 0 };
@@ -315,7 +453,7 @@ metaprog_socket_connect_callback(PurpleSocket *ps, const gchar *error, gpointer 
 	for (;;) {
 		while ((size = purple_socket_read(ps, buf, BUF_SIZE)) > 0) {
 			// looks like auth result
-			if (size == 10) {
+			if (co->cmd == METAPROG_CMD_PROBE && size == 10) {
 				gboolean known_auth = TRUE;
 
 				enum METAPROG_CONNECTION auth_result = (int)metaprog_char_to_guint32(buf + 6);
@@ -331,7 +469,7 @@ metaprog_socket_connect_callback(PurpleSocket *ps, const gchar *error, gpointer 
 					purple_connection_error(ma->pc, PURPLE_CONNECTION_ERROR_INVALID_USERNAME, _("User not found"));
 				break;
 				case METAPROG_CONNECTION_STATE_CONNECTED:
-					// noop, authenticated successfully
+					purple_connection_set_state(ma->pc, PURPLE_CONNECTION_CONNECTED);
 				break;
 				default:
 					known_auth = FALSE;
@@ -341,11 +479,26 @@ metaprog_socket_connect_callback(PurpleSocket *ps, const gchar *error, gpointer 
 				purple_debug_info("metaprog", "auth_result = %d\n", auth_result);
 
 				if (known_auth) {
-					metaprog_send_cmd(METAPROG_CMD_AUTH_SUCCESS, ma);
 					metaprog_send_cmd(METAPROG_CMD_REQUEST_CHATS, ma);
+					//metaprog_send_cmd(METAPROG_CMD_REQUEST_CHATS, ma);
 					read_finished = TRUE;
 					break;
 				}
+			}
+			else if (co->cmd == METAPROG_CMD_REQUEST_CHATS) {
+				GError *error = NULL;
+
+				metaprog_socket_read_chats_list(buf, size, ma, &error);
+				read_finished = TRUE;
+
+				if (error != NULL) {
+					purple_debug_error("metaprog", error->message);
+					g_free(error);
+				}
+
+				last_cmd = TRUE;
+
+				break;
 			}
 
 			purple_debug_error("metaprog", "Unknown incoming data, please report this to developers:");
@@ -370,9 +523,12 @@ metaprog_socket_connect_callback(PurpleSocket *ps, const gchar *error, gpointer 
 	if (!ma->connection_closed) {
 		// reopen the socket for the next command
 		purple_socket_destroy(ps);
+
 		PurpleConnection *pc = purple_account_get_connection(ma->account);
 		ma->socket = purple_socket_new(pc);
-		metaprog_socket_init(ma);
+		if (!last_cmd) {
+			metaprog_socket_init(ma);
+		}
 
 		g_free(co->payload);
 		g_free(co);
@@ -421,9 +577,13 @@ metaprog_login(PurpleAccount *account)
 	ma->socket = purple_socket_new(pc);
 	ma->cmd_queue =	g_queue_new();
 
+	ma->default_group = metaprog_get_or_create_default_group(NULL);
+
 	ma->connection_closed = FALSE;
 
 	metaprog_auth_string(ma);
+
+	ma->chats_list = g_hash_table_new_full(g_direct_hash, g_str_equal, NULL, g_free);
 
 	metaprog_session_start(ma);
 	
@@ -450,6 +610,7 @@ metaprog_close(PurpleConnection *pc)
 	purple_socket_destroy(ma->socket);
 	
 	g_free(ma->auth_string);
+	g_hash_table_destroy(ma->chats_list);
 	g_free(ma);
 }
 
@@ -535,8 +696,8 @@ plugin_init(PurplePlugin *plugin)
 	// prpl_info->set_status = metaprog_set_status;
 	// prpl_info->set_idle = metaprog_set_idle;
 	prpl_info->status_types = metaprog_status_types;
-	// prpl_info->chat_info = metaprog_chat_info;
-	// prpl_info->chat_info_defaults = metaprog_chat_info_defaults;
+	prpl_info->chat_info = metaprog_chat_info;
+	prpl_info->chat_info_defaults = metaprog_chat_info_defaults;
 	prpl_info->login = metaprog_login;
 	prpl_info->close = metaprog_close;
 	prpl_info->send_im = metaprog_send_im;
@@ -649,8 +810,8 @@ static void
 metaprog_protocol_chat_iface_init(PurpleProtocolChatIface *prpl_info)
 {
 	prpl_info->send = metaprog_chat_send;
-	// prpl_info->info = metaprog_chat_info;
-	// prpl_info->info_defaults = metaprog_chat_info_defaults;
+	prpl_info->info = metaprog_chat_info;
+	prpl_info->info_defaults = metaprog_chat_info_defaults;
 	// prpl_info->join = metaprog_join_chat;
 	prpl_info->get_name = metaprog_get_chat_name;
 	// prpl_info->invite = metaprog_chat_invite;
