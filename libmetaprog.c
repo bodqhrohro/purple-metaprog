@@ -105,6 +105,11 @@ typedef struct {
 	char *payload;
 } MetaprogCmdObject;
 
+typedef struct {
+	gchar* name;
+	guint32 unread_count;
+} MetaprogChat;
+
 
 
 /*static void
@@ -113,6 +118,14 @@ metaprog_util_free_gchar(gpointer data)
 	gchar *ch = data;
 	g_free(ch);
 }*/
+
+static void
+metaprog_util_free_chat(gpointer data)
+{
+	MetaprogChat *chat = data;
+	g_free(chat->name);
+	g_free(chat);
+}
 
 
 
@@ -345,17 +358,19 @@ static void
 metaprog_populate_buddy_list(gpointer key, gpointer value, gpointer user_data)
 {
 	guint32 id = GPOINTER_TO_UINT(key);
-	gchar *name = value;
+	MetaprogChat *chat = value;
 	MetaprogAccount *ma = user_data;
 
 	char *string_id = g_strdup_printf("%d", id);
 
-	PurpleChat *chat = purple_blist_find_chat(ma->account, string_id);
+	PurpleChat *purple_chat = purple_blist_find_chat(ma->account, string_id);
 
-	if (chat == NULL) {
-		chat = purple_chat_new(ma->account, name, metaprog_chat_info_new(ma->pc, id, name));
+	if (purple_chat == NULL) {
+		purple_chat = purple_chat_new(ma->account, chat->name, metaprog_chat_info_new(ma->pc, id, chat->name));
 
-		purple_blist_add_chat(chat, ma->default_group, NULL);
+		purple_blist_add_chat(purple_chat, ma->default_group, NULL);
+	} else {
+		// TODO: update the chat label, if API allows it at all
 	}
 
 	g_free(string_id);
@@ -371,13 +386,17 @@ metaprog_socket_read_chats_list(guchar *buf, gssize size, MetaprogAccount *ma, G
 	guint offset = 8;
 
 	guint32 chat_id;
+	guint32 unread_count;
+	gpointer chat_id_pointer;
 	guint32 name_length;
 	gchar *name;
+	MetaprogChat *chat;
 
 	for (int i = 0; i < chat_count; i ++) {
 		if (offset + 12 > size) break;
 
 		chat_id = metaprog_char_to_guint32(buf + offset);
+		unread_count = metaprog_char_to_guint32(buf + offset + 4);
 		name_length = metaprog_char_to_guint32(buf + offset + 8);
 
 		offset += 12;
@@ -389,7 +408,21 @@ metaprog_socket_read_chats_list(guchar *buf, gssize size, MetaprogAccount *ma, G
 			break;
 		}
 
-		g_hash_table_insert(ma->chats_list, GUINT_TO_POINTER(chat_id), name);
+		chat_id_pointer = GUINT_TO_POINTER(chat_id);
+		chat = (MetaprogChat*)g_hash_table_lookup(ma->chats_list, chat_id_pointer);
+		if (chat == NULL) {
+			chat = g_new0(MetaprogChat, 1);
+			g_hash_table_insert(ma->chats_list, chat_id_pointer, chat);
+		}
+
+		chat->unread_count = unread_count;
+		if (g_strcmp0(name, chat->name)) {
+			g_free(chat->name);
+			chat->name = name;
+		} else {
+			g_free(name);
+		}
+
 		offset += name_length;
 	}
 
@@ -583,7 +616,7 @@ metaprog_login(PurpleAccount *account)
 
 	metaprog_auth_string(ma);
 
-	ma->chats_list = g_hash_table_new_full(g_direct_hash, g_str_equal, NULL, g_free);
+	ma->chats_list = g_hash_table_new_full(g_direct_hash, g_str_equal, NULL, metaprog_util_free_chat);
 
 	metaprog_session_start(ma);
 	
