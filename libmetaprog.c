@@ -103,6 +103,9 @@ typedef struct {
 typedef struct {
 	enum METAPROG_CMD cmd;
 	char *payload;
+	guint delay;
+
+	MetaprogAccount *ma;
 } MetaprogCmdObject;
 
 typedef struct {
@@ -315,10 +318,13 @@ metaprog_get_chat_history(MetaprogAccount *ia, const gchar* chatId, const gchar*
 }*/
 
 static void
-metaprog_send_cmd(enum METAPROG_CMD cmd, MetaprogAccount *ma)
+metaprog_send_cmd(enum METAPROG_CMD cmd, MetaprogAccount *ma, guint delay)
 {
 	MetaprogCmdObject *co = g_new0(MetaprogCmdObject, 1);
 	co->cmd = cmd;
+	co->delay = delay;
+
+	co->ma = ma;
 
 	g_queue_push_head(ma->cmd_queue, co);
 }
@@ -352,7 +358,35 @@ metaprog_auth_string(MetaprogAccount *ma)
 	}*/
 }
 
-static void metaprog_socket_init(MetaprogAccount *ma);
+static void metaprog_socket_init(MetaprogCmdObject *co);
+
+static gboolean
+metaprog_cmd_delay_callback(gpointer user_data)
+{
+	MetaprogCmdObject *co = user_data;
+	if (!co->ma->connection_closed) {
+		PurpleConnection *pc = purple_account_get_connection(co->ma->account);
+		co->ma->socket = purple_socket_new(pc);
+		metaprog_socket_init(co);
+	}
+
+	// prevent repeated calls
+	return FALSE;
+}
+
+static void
+metaprog_next_cmd(MetaprogAccount *ma)
+{
+	MetaprogCmdObject *co = g_queue_pop_tail(ma->cmd_queue);
+
+	if (co == NULL) return;
+
+	if (co->delay) {
+		purple_timeout_add_seconds(co->delay, metaprog_cmd_delay_callback, co);
+	} else {
+		metaprog_cmd_delay_callback(co);
+	}
+}
 
 static void
 metaprog_populate_buddy_list(gpointer key, gpointer value, gpointer user_data)
@@ -442,20 +476,8 @@ metaprog_socket_connect_callback(PurpleSocket *ps, const gchar *error, gpointer 
 		return;
 	}
 
-	MetaprogAccount *ma = user_data;
-
-	MetaprogCmdObject *co;
-
-	// wait for the command
-	for (;;) {
-		if (ma->connection_closed) return;
-
-		co = g_queue_pop_tail(ma->cmd_queue);
-
-		if (co != NULL) break;
-
-		usleep(POLL_INTERVAL);
-	}
+	MetaprogCmdObject *co = user_data;
+	MetaprogAccount *ma = co->ma;
 
 	gssize size;
 
@@ -478,7 +500,6 @@ metaprog_socket_connect_callback(PurpleSocket *ps, const gchar *error, gpointer 
 	// process the response
 	guchar buf[BUF_SIZE];
 	gboolean read_finished = FALSE;
-	gboolean last_cmd = FALSE;
 
 	int fd = purple_socket_get_fd(ps);
 	struct pollfd fds[1] = { fd, POLLIN, 0 };
@@ -512,8 +533,7 @@ metaprog_socket_connect_callback(PurpleSocket *ps, const gchar *error, gpointer 
 				purple_debug_info("metaprog", "auth_result = %d\n", auth_result);
 
 				if (known_auth) {
-					metaprog_send_cmd(METAPROG_CMD_REQUEST_CHATS, ma);
-					//metaprog_send_cmd(METAPROG_CMD_REQUEST_CHATS, ma);
+					metaprog_send_cmd(METAPROG_CMD_REQUEST_CHATS, ma, 0);
 					read_finished = TRUE;
 					break;
 				}
@@ -529,8 +549,6 @@ metaprog_socket_connect_callback(PurpleSocket *ps, const gchar *error, gpointer 
 					g_free(error);
 				}
 
-				last_cmd = TRUE;
-
 				break;
 			}
 
@@ -538,6 +556,8 @@ metaprog_socket_connect_callback(PurpleSocket *ps, const gchar *error, gpointer 
 			for (int i = 0; i < size; i ++) {
 				purple_debug_error("metaprog", "buf[%d] = %x\n", i, buf[i]);
 			}
+			read_finished = TRUE;
+			break;
 		}
 
 		if (read_finished) break;
@@ -550,30 +570,25 @@ metaprog_socket_connect_callback(PurpleSocket *ps, const gchar *error, gpointer 
 		usleep(POLL_INTERVAL);
 		poll(fds, 1, POLL_TIMEOUT);
 
-		if (ma->connection_closed) return;
+		if (ma->connection_closed) break;
 	}
+
+	g_free(co->payload);
+	g_free(co);
 
 	if (!ma->connection_closed) {
-		// reopen the socket for the next command
 		purple_socket_destroy(ps);
-
-		PurpleConnection *pc = purple_account_get_connection(ma->account);
-		ma->socket = purple_socket_new(pc);
-		if (!last_cmd) {
-			metaprog_socket_init(ma);
-		}
-
-		g_free(co->payload);
-		g_free(co);
 	}
+
+	metaprog_next_cmd(ma);
 }
 
 static void
-metaprog_socket_init(MetaprogAccount *ma) {
-	purple_socket_set_host(ma->socket, ma->host);
-	purple_socket_set_port(ma->socket, ma->port);
+metaprog_socket_init(MetaprogCmdObject *co) {
+	purple_socket_set_host(co->ma->socket, co->ma->host);
+	purple_socket_set_port(co->ma->socket, co->ma->port);
 
-	purple_socket_connect(ma->socket, metaprog_socket_connect_callback, ma);
+	purple_socket_connect(co->ma->socket, metaprog_socket_connect_callback, co);
 }
 
 static void
@@ -591,9 +606,8 @@ metaprog_session_start(MetaprogAccount *ma)
 		return;
 	}
 
-	metaprog_send_cmd(METAPROG_CMD_PROBE, ma);
-
-	metaprog_socket_init(ma);
+	metaprog_send_cmd(METAPROG_CMD_PROBE, ma, 0);
+	metaprog_next_cmd(ma);
 }
 
 static void
@@ -607,7 +621,6 @@ metaprog_login(PurpleAccount *account)
 	ma->account = account;
 	ma->pc = pc;
 
-	ma->socket = purple_socket_new(pc);
 	ma->cmd_queue =	g_queue_new();
 
 	ma->default_group = metaprog_get_or_create_default_group(NULL);
@@ -639,8 +652,6 @@ metaprog_close(PurpleConnection *pc)
 		g_free(co);
 	}
 	g_queue_free(ma->cmd_queue);
-
-	purple_socket_destroy(ma->socket);
 	
 	g_free(ma->auth_string);
 	g_hash_table_destroy(ma->chats_list);
