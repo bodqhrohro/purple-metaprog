@@ -491,6 +491,9 @@ metaprog_socket_read_chats_list(guchar *buf, gssize size, MetaprogAccount *ma, G
 	}*/
 
 	g_hash_table_foreach(ma->chats_list, metaprog_populate_buddy_list, ma);
+
+	// delay the next query
+	metaprog_send_cmd(ma, METAPROG_CMD_REQUEST_CHATS, NULL, 1);
 }
 
 static void
@@ -819,7 +822,7 @@ metaprog_login(PurpleAccount *account)
 
 	metaprog_auth_string(ma);
 
-	ma->chats_list = g_hash_table_new_full(g_direct_hash, g_str_equal, NULL, metaprog_util_free_chat);
+	ma->chats_list = g_hash_table_new_full(g_direct_hash, g_direct_equal, NULL, metaprog_util_free_chat);
 
 	metaprog_session_start(ma);
 	
