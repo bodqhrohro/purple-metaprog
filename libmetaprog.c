@@ -59,7 +59,7 @@ enum METAPROG_CMD
 {
 	METAPROG_CMD_PROBE = 0,
 	METAPROG_CMD_REQUEST_CHATS = 3,
-	//METAPROG_CMD_REQUEST_CHATS = 10,
+	METAPROG_CMD_REQUEST_CHAT_UPDATE = 5,
 };
 
 
@@ -78,6 +78,31 @@ static guint32
 metaprog_char_to_guint32(guchar* src)
 {
 	return (*src << 24) | (*(src+1) << 16) | (*(src+2) << 8) | *(src+3);
+}
+
+static guint
+metaprog_metaprog_string_to_c_string(char *src, guint offset, guint safe_size, char **dest, guint32 *length, GError **error) {
+	if (safe_size > -1 && safe_size < offset + 4) {
+		g_set_error_literal(error, G_CONVERT_ERROR, G_CONVERT_ERROR_PARTIAL_INPUT, "Can't read the string length");
+		return offset;
+	}
+
+	guint32 string_length = metaprog_char_to_guint32(src + offset);
+	offset += 4;
+
+	if (safe_size > -1 && safe_size < offset + string_length) {
+		g_set_error_literal(error, G_CONVERT_ERROR, G_CONVERT_ERROR_PARTIAL_INPUT, "Can't read the string content");
+		return offset;
+	}
+
+	*dest = g_convert(src + offset, string_length, "UTF-8", "Cp1251", NULL, NULL, error);
+	offset += string_length;
+
+	if (length != NULL) {
+		*length = string_length;
+	}
+
+	return offset;
 }
 
 
@@ -115,12 +140,12 @@ typedef struct {
 
 
 
-/*static void
+static void
 metaprog_util_free_gchar(gpointer data)
 {
 	gchar *ch = data;
 	g_free(ch);
-}*/
+}
 
 static void
 metaprog_util_free_chat(gpointer data)
@@ -318,10 +343,11 @@ metaprog_get_chat_history(MetaprogAccount *ia, const gchar* chatId, const gchar*
 }*/
 
 static void
-metaprog_send_cmd(enum METAPROG_CMD cmd, MetaprogAccount *ma, guint delay)
+metaprog_send_cmd(MetaprogAccount *ma, enum METAPROG_CMD cmd, gchar *payload, guint delay)
 {
 	MetaprogCmdObject *co = g_new0(MetaprogCmdObject, 1);
 	co->cmd = cmd;
+	co->payload = payload;
 	co->delay = delay;
 
 	co->ma = ma;
@@ -395,7 +421,7 @@ metaprog_populate_buddy_list(gpointer key, gpointer value, gpointer user_data)
 	MetaprogChat *chat = value;
 	MetaprogAccount *ma = user_data;
 
-	char *string_id = g_strdup_printf("%d", id);
+	gchar *string_id = g_strdup_printf("%d", id);
 
 	PurpleChat *purple_chat = purple_blist_find_chat(ma->account, string_id);
 
@@ -422,22 +448,21 @@ metaprog_socket_read_chats_list(guchar *buf, gssize size, MetaprogAccount *ma, G
 	guint32 chat_id;
 	guint32 unread_count;
 	gpointer chat_id_pointer;
-	guint32 name_length;
+	gchar *chat_id_string;
 	gchar *name;
 	MetaprogChat *chat;
 
 	for (int i = 0; i < chat_count; i ++) {
-		if (offset + 12 > size) break;
+		if (offset + 8 > size) break;
 
-		chat_id = metaprog_char_to_guint32(buf + offset);
+		chat_id_string = (gchar*)g_memdup(buf + offset, 4);
+		chat_id = metaprog_char_to_guint32(chat_id_string);
+
 		unread_count = metaprog_char_to_guint32(buf + offset + 4);
-		name_length = metaprog_char_to_guint32(buf + offset + 8);
 
-		offset += 12;
+		offset += 8;
 
-		if (offset + name_length > size) break;
-
-		name = g_convert(buf + offset, name_length, "UTF-8", "Cp1251", NULL, NULL, error);
+		offset = metaprog_metaprog_string_to_c_string(buf, offset, size, &name, NULL, error);
 		if ((*error) != NULL) {
 			break;
 		}
@@ -450,6 +475,7 @@ metaprog_socket_read_chats_list(guchar *buf, gssize size, MetaprogAccount *ma, G
 		}
 
 		chat->unread_count = unread_count;
+
 		if (g_strcmp0(name, chat->name)) {
 			g_free(chat->name);
 			chat->name = name;
@@ -457,7 +483,7 @@ metaprog_socket_read_chats_list(guchar *buf, gssize size, MetaprogAccount *ma, G
 			g_free(name);
 		}
 
-		offset += name_length;
+		metaprog_send_cmd(ma, METAPROG_CMD_REQUEST_CHAT_UPDATE, chat_id_string, 0);
 	}
 
 	// TODO: fetch next chunks if all chats don't fit in one buffer
@@ -465,6 +491,142 @@ metaprog_socket_read_chats_list(guchar *buf, gssize size, MetaprogAccount *ma, G
 	}*/
 
 	g_hash_table_foreach(ma->chats_list, metaprog_populate_buddy_list, ma);
+}
+
+static void
+metaprog_socket_read_chat_update(guchar *buf, gssize size, MetaprogAccount *ma, guint32 chat_id, GError **error)
+{
+	if (size < 4) return;
+
+	guint32 response_size = metaprog_char_to_guint32(buf);
+
+	PurpleConnection *pc = purple_socket_get_connection(ma->socket);
+
+	// TODO: fetch all the chunks
+	if (response_size + 4 > size) {
+		purple_connection_error(pc, PURPLE_CONNECTION_ERROR_OTHER_ERROR, _("Chat info buffer overflow"));
+		return;
+	}
+
+	// read the chat name
+	guint offset = 4;
+
+	gchar *new_name;
+	offset = metaprog_metaprog_string_to_c_string(buf, offset, size, &new_name, NULL, error);
+	if ((*error) != NULL) {
+		return;
+	}
+
+	// retrieve the corresponding chat data
+	gchar *string_id = g_strdup_printf("%d", chat_id);
+
+	PurpleChat *purple_chat = purple_blist_find_chat(ma->account, string_id);
+
+	g_free(string_id);
+
+	if (purple_chat == NULL) {
+		purple_connection_error(pc, PURPLE_CONNECTION_ERROR_OTHER_ERROR, "Chat list is corrupted, aborting");
+		return;
+	}
+
+	GHashTable *components = purple_chat_get_components(purple_chat);
+	gchar *name = g_hash_table_lookup(components, "name");
+
+	// update the chat name if it has changed
+	if (g_strcmp0(name, new_name)) {
+		g_hash_table_replace(components, "name", new_name);
+
+		// this will be freed instead
+		new_name = name;
+
+		name = g_hash_table_lookup(components, "name");
+	}
+
+	g_free(new_name);
+
+	// pop the conversation or find the existing one
+	PurpleConversation *purple_conv = purple_find_conversation_with_account(PURPLE_CONV_TYPE_CHAT, name, ma->account);
+	if (purple_conv == NULL) {
+		purple_conv = purple_conversation_new(PURPLE_CONV_TYPE_CHAT, ma->account, name);
+		purple_conversation_present(purple_conv);
+	}
+	PurpleConvChat *chat_data = purple_conversation_get_chat_data(purple_conv);
+
+	// add new messages
+	int i;
+
+	guint32 messages_count = metaprog_char_to_guint32(buf + offset);
+	offset += 4;
+
+	gchar *message;
+	GQueue *messages = g_queue_new();
+	for (i = 0; i < messages_count; i ++) {
+		offset = metaprog_metaprog_string_to_c_string(buf, offset, size, &message, NULL, error);
+		if ((*error) != NULL) {
+			return;
+		}
+
+		g_queue_push_tail(messages, message);
+	}
+
+	guint32 senders_count = metaprog_char_to_guint32(buf + offset);
+	offset += 4;
+
+	if (messages_count != senders_count) {
+		purple_connection_error(pc, PURPLE_CONNECTION_ERROR_OTHER_ERROR, _("Mismatch of messages and senders number, aborting"));
+		g_queue_free_full(messages, metaprog_util_free_gchar);
+		return;
+	}
+
+	gchar *sender;
+	GQueue *senders = g_queue_new();
+	for (i = 0; i < messages_count; i ++) {
+		offset = metaprog_metaprog_string_to_c_string(buf, offset, size, &sender, NULL, error);
+		if ((*error) != NULL) {
+			return;
+		}
+
+		g_queue_push_tail(senders, sender);
+	}
+
+	for (;;) {
+		message = g_queue_pop_head(messages);
+		sender = g_queue_pop_head(senders);
+
+		if (message == NULL) break;
+
+		purple_conv_chat_write(chat_data, sender, message, PURPLE_MESSAGE_RECV, 0);
+
+		g_free(message);
+		g_free(sender);
+	}
+
+	// update the room roster
+	guint32 members_count = metaprog_char_to_guint32(buf + offset);
+	offset += 4;
+
+	gchar* member_name;
+	guint8 status;
+
+	PurpleConvChatBuddyFlags flags;
+
+	for (i = 0; i < members_count; i ++) {
+		offset = metaprog_metaprog_string_to_c_string(buf, offset, size, &member_name, NULL, error);
+		if ((*error) != NULL) {
+			return;
+		}
+
+		status = buf[offset ++];
+		flags = status > 0 ? PURPLE_CBFLAGS_VOICE : PURPLE_CBFLAGS_AWAY;
+
+		if (purple_conv_chat_find_user(chat_data, member_name)) {
+			purple_conv_chat_user_set_flags(chat_data, member_name, flags);
+		} else {
+			purple_chat_conversation_add_user(chat_data, member_name, NULL, flags, FALSE);
+		}
+
+		g_free(member_name);
+	}
 }
 
 static void
@@ -482,7 +644,14 @@ metaprog_socket_connect_callback(PurpleSocket *ps, const gchar *error, gpointer 
 	gssize size;
 
 	// send command
-	char *cmd_string = (char*)g_memdup(ma->auth_string, ma->auth_string_len);
+	char *cmd_string;
+	//if (co->cmd == METAPROG_CMD_REQUEST_CHAT_UPDATE) {
+		//cmd_string = g_new(char, ma->auth_string_len + 4);
+		//memcpy(cmd_string, ma->auth_string, ma->auth_string_len);
+		//memcpy(cmd_string + ma->auth_string_len, co->payload, 4);
+	//} else {
+		cmd_string = (char*)g_memdup(ma->auth_string, ma->auth_string_len);
+	//}
 	cmd_string[9] = co->cmd & 0xff;
 
 	size = purple_socket_write(ps, cmd_string, ma->auth_string_len);
@@ -492,6 +661,16 @@ metaprog_socket_connect_callback(PurpleSocket *ps, const gchar *error, gpointer 
 			purple_debug_error("metaprog", "Socket write error: %d\n", errno);
 		} else {
 			purple_debug_error("metaprog", "The socket has choked! Feed it carefully! %d %d\n", size, ma->auth_string_len);
+		}
+	}
+	if (co->cmd == METAPROG_CMD_REQUEST_CHAT_UPDATE) {
+		size = purple_socket_write(ps, co->payload, 4);
+		if (size != 4) {
+			if (size == -1) {
+				purple_debug_error("metaprog", "Socket write error: %d\n", errno);
+			} else {
+				purple_debug_error("metaprog", "The socket has choked! Feed it carefully! %d %d\n", size, 4);
+			}
 		}
 	}
 
@@ -506,6 +685,8 @@ metaprog_socket_connect_callback(PurpleSocket *ps, const gchar *error, gpointer 
 
 	for (;;) {
 		while ((size = purple_socket_read(ps, buf, BUF_SIZE)) > 0) {
+			GError *error = NULL;
+
 			// looks like auth result
 			if (co->cmd == METAPROG_CMD_PROBE && size == 10) {
 				gboolean known_auth = TRUE;
@@ -533,15 +714,24 @@ metaprog_socket_connect_callback(PurpleSocket *ps, const gchar *error, gpointer 
 				purple_debug_info("metaprog", "auth_result = %d\n", auth_result);
 
 				if (known_auth) {
-					metaprog_send_cmd(METAPROG_CMD_REQUEST_CHATS, ma, 0);
+					metaprog_send_cmd(ma, METAPROG_CMD_REQUEST_CHATS, NULL, 0);
 					read_finished = TRUE;
 					break;
 				}
 			}
 			else if (co->cmd == METAPROG_CMD_REQUEST_CHATS) {
-				GError *error = NULL;
-
 				metaprog_socket_read_chats_list(buf, size, ma, &error);
+				read_finished = TRUE;
+
+				if (error != NULL) {
+					purple_debug_error("metaprog", error->message);
+					g_free(error);
+				}
+
+				break;
+			}
+			else if (co->cmd == METAPROG_CMD_REQUEST_CHAT_UPDATE) {
+				metaprog_socket_read_chat_update(buf, size, ma, metaprog_char_to_guint32(co->payload), &error);
 				read_finished = TRUE;
 
 				if (error != NULL) {
@@ -606,7 +796,7 @@ metaprog_session_start(MetaprogAccount *ma)
 		return;
 	}
 
-	metaprog_send_cmd(METAPROG_CMD_PROBE, ma, 0);
+	metaprog_send_cmd(ma, METAPROG_CMD_PROBE, NULL, 0);
 	metaprog_next_cmd(ma);
 }
 
