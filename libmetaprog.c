@@ -206,10 +206,10 @@ metaprog_chat_info_new(PurpleConnection *pc, guint32 id, const char* name)
 {
 	GHashTable *ht = g_hash_table_new_full(g_str_hash, g_str_equal, NULL, g_free);
 
-	g_hash_table_insert(ht, "id", g_strdup_printf("%d", id));
+	g_hash_table_insert(ht, g_strdup("id"), g_strdup_printf("%d", id));
 	if (name != NULL)
 	{
-		g_hash_table_insert(ht, "name", g_strdup(name));
+		g_hash_table_insert(ht, g_strdup("name"), g_strdup(name));
 	}
 
 	return ht;
@@ -220,10 +220,10 @@ metaprog_chat_info_defaults(PurpleConnection *pc, const char *chatname)
 {
 	GHashTable *defaults = g_hash_table_new_full(g_str_hash, g_str_equal, NULL, g_free);
 
-	g_hash_table_insert(defaults, "id", "0");
+	g_hash_table_insert(defaults, g_strdup("id"), g_strdup("0"));
 	if (chatname != NULL)
 	{
-		g_hash_table_insert(defaults, "name", g_strdup(chatname));
+		g_hash_table_insert(defaults, g_strdup("name"), g_strdup(chatname));
 	}
 
 	return defaults;
