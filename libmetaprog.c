@@ -486,10 +486,6 @@ metaprog_socket_read_chats_list(guchar *buf, gssize size, MetaprogAccount *ma, G
 		metaprog_send_cmd(ma, METAPROG_CMD_REQUEST_CHAT_UPDATE, chat_id_string, 0);
 	}
 
-	// TODO: fetch next chunks if all chats don't fit in one buffer
-	/*while ((size = purple_socket_read(ma->socket, buf, BUF_SIZE)) > 0) {
-	}*/
-
 	g_hash_table_foreach(ma->chats_list, metaprog_populate_buddy_list, ma);
 
 	// delay the next query
@@ -637,11 +633,7 @@ metaprog_get_required_packet_size(MetaprogCmdObject *co, gchar* buf, guint size)
 	if (co->cmd == METAPROG_CMD_PROBE) {
 		return 10;
 	}
-	else if (co->cmd == METAPROG_CMD_REQUEST_CHATS) {
-		// any is appropriate, the command handler has to fetch further chunks itself :(
-		return 8;
-	}
-	else if (co->cmd == METAPROG_CMD_REQUEST_CHAT_UPDATE) {
+	else if (co->cmd == METAPROG_CMD_REQUEST_CHATS || co->cmd == METAPROG_CMD_REQUEST_CHAT_UPDATE) {
 		if (size < 4) return -1;
 
 		return metaprog_char_to_guint32(buf);
