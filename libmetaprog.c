@@ -632,6 +632,25 @@ metaprog_socket_read_chat_update(guchar *buf, gssize size, MetaprogAccount *ma, 
 	}
 }
 
+static guint32
+metaprog_get_required_packet_size(MetaprogCmdObject *co, gchar* buf, guint size) {
+	if (co->cmd == METAPROG_CMD_PROBE) {
+		return 10;
+	}
+	else if (co->cmd == METAPROG_CMD_REQUEST_CHATS) {
+		// any is appropriate, the command handler has to fetch further chunks itself :(
+		return 8;
+	}
+	else if (co->cmd == METAPROG_CMD_REQUEST_CHAT_UPDATE) {
+		if (size < 4) return -1;
+
+		return metaprog_char_to_guint32(buf);
+	}
+
+	// not enough information yet
+	return -1;
+}
+
 static void
 metaprog_socket_connect_callback(PurpleSocket *ps, const gchar *error, gpointer user_data)
 {
@@ -681,90 +700,97 @@ metaprog_socket_connect_callback(PurpleSocket *ps, const gchar *error, gpointer 
 
 	// process the response
 	guchar buf[BUF_SIZE];
-	gboolean read_finished = FALSE;
+	GArray *packet = g_array_new(FALSE, FALSE, 1);
 
 	int fd = purple_socket_get_fd(ps);
 	struct pollfd fds[1] = { fd, POLLIN, 0 };
 
+	guint32 required_size = metaprog_get_required_packet_size(co, packet->data, 0);
+	gboolean successful_read = TRUE;
+
 	for (;;) {
 		while ((size = purple_socket_read(ps, buf, BUF_SIZE)) > 0) {
-			GError *error = NULL;
-
-			// looks like auth result
-			if (co->cmd == METAPROG_CMD_PROBE && size == 10) {
-				gboolean known_auth = TRUE;
-
-				enum METAPROG_CONNECTION auth_result = (int)metaprog_char_to_guint32(buf + 6);
-
-				switch (auth_result) {
-				case METAPROG_CONNECTION_STATE_FAILURE:
-					purple_connection_error(ma->pc, PURPLE_CONNECTION_ERROR_AUTHENTICATION_FAILED, _("Generic authentication error (0x01)"));
-				break;
-				case METAPROG_CONNECTION_STATE_WRONG_PASSWORD:
-					purple_connection_error(ma->pc, PURPLE_CONNECTION_ERROR_AUTHENTICATION_FAILED, _("Wrong password"));
-				break;
-				case METAPROG_CONNECTION_STATE_USER_NOT_FOUND:
-					purple_connection_error(ma->pc, PURPLE_CONNECTION_ERROR_INVALID_USERNAME, _("User not found"));
-				break;
-				case METAPROG_CONNECTION_STATE_CONNECTED:
-					purple_connection_set_state(ma->pc, PURPLE_CONNECTION_CONNECTED);
-				break;
-				default:
-					known_auth = FALSE;
-				break;
-				}
-
-				purple_debug_info("metaprog", "auth_result = %d\n", auth_result);
-
-				if (known_auth) {
-					metaprog_send_cmd(ma, METAPROG_CMD_REQUEST_CHATS, NULL, 0);
-					read_finished = TRUE;
-					break;
-				}
-			}
-			else if (co->cmd == METAPROG_CMD_REQUEST_CHATS) {
-				metaprog_socket_read_chats_list(buf, size, ma, &error);
-				read_finished = TRUE;
-
-				if (error != NULL) {
-					purple_debug_error("metaprog", error->message);
-					g_free(error);
-				}
-
-				break;
-			}
-			else if (co->cmd == METAPROG_CMD_REQUEST_CHAT_UPDATE) {
-				metaprog_socket_read_chat_update(buf, size, ma, metaprog_char_to_guint32(co->payload), &error);
-				read_finished = TRUE;
-
-				if (error != NULL) {
-					purple_debug_error("metaprog", error->message);
-					g_free(error);
-				}
-
-				break;
-			}
-
-			purple_debug_error("metaprog", "Unknown incoming data, please report this to developers:");
-			for (int i = 0; i < size; i ++) {
-				purple_debug_error("metaprog", "buf[%d] = %x\n", i, buf[i]);
-			}
-			read_finished = TRUE;
-			break;
+			g_array_append_vals(packet, buf, size);
 		}
-
-		if (read_finished) break;
 
 		if (size < 0 && errno != EAGAIN) {
 			purple_debug_error("metaprog", "errno = %d\n", errno);
+			successful_read = FALSE;
 			break;
 		}
+
+		if (required_size == -1) {
+			required_size = metaprog_get_required_packet_size(co, packet->data, packet->len);
+		}
+
+		if (packet->len >= required_size) break;
 
 		usleep(POLL_INTERVAL);
 		poll(fds, 1, POLL_TIMEOUT);
 
-		if (ma->connection_closed) break;
+		if (ma->connection_closed) {
+			successful_read = FALSE;
+			break;
+		}
 	}
+
+	if (successful_read) {
+		GError *error = NULL;
+
+		if (co->cmd == METAPROG_CMD_PROBE) {
+			gboolean known_auth = TRUE;
+
+			enum METAPROG_CONNECTION auth_result = (int)metaprog_char_to_guint32(packet->data + 6);
+
+			switch (auth_result) {
+			case METAPROG_CONNECTION_STATE_FAILURE:
+				purple_connection_error(ma->pc, PURPLE_CONNECTION_ERROR_AUTHENTICATION_FAILED, _("Generic authentication error (0x01)"));
+			break;
+			case METAPROG_CONNECTION_STATE_WRONG_PASSWORD:
+				purple_connection_error(ma->pc, PURPLE_CONNECTION_ERROR_AUTHENTICATION_FAILED, _("Wrong password"));
+			break;
+			case METAPROG_CONNECTION_STATE_USER_NOT_FOUND:
+				purple_connection_error(ma->pc, PURPLE_CONNECTION_ERROR_INVALID_USERNAME, _("User not found"));
+			break;
+			case METAPROG_CONNECTION_STATE_CONNECTED:
+				purple_connection_set_state(ma->pc, PURPLE_CONNECTION_CONNECTED);
+			break;
+			default:
+				known_auth = FALSE;
+			break;
+			}
+
+			purple_debug_info("metaprog", "auth_result = %d\n", auth_result);
+
+			if (known_auth) {
+				metaprog_send_cmd(ma, METAPROG_CMD_REQUEST_CHATS, NULL, 0);
+			}
+		}
+		else if (co->cmd == METAPROG_CMD_REQUEST_CHATS) {
+			metaprog_socket_read_chats_list(packet->data, packet->len, ma, &error);
+
+			if (error != NULL) {
+				purple_debug_error("metaprog", error->message);
+				g_free(error);
+			}
+		}
+		else if (co->cmd == METAPROG_CMD_REQUEST_CHAT_UPDATE) {
+			metaprog_socket_read_chat_update(packet->data, packet->len, ma, metaprog_char_to_guint32(co->payload), &error);
+
+			if (error != NULL) {
+				purple_debug_error("metaprog", error->message);
+				g_free(error);
+			}
+		}
+		else {
+			purple_debug_error("metaprog", "Unknown incoming data, please report this to developers:");
+			for (int i = 0; i < packet->len; i ++) {
+				purple_debug_error("metaprog", "buf[%d] = %x\n", i, packet->data[i]);
+			}
+		}
+	}
+
+	g_array_free(packet, TRUE);
 
 	g_free(co->payload);
 	g_free(co);
