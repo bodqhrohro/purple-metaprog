@@ -59,6 +59,7 @@ enum METAPROG_CMD
 {
 	METAPROG_CMD_PROBE = 0,
 	METAPROG_CMD_REQUEST_CHATS = 3,
+	METAPROG_CMD_SEND_MESSAGE = 4,
 	METAPROG_CMD_REQUEST_CHAT_UPDATE = 5,
 };
 
@@ -128,6 +129,7 @@ typedef struct {
 typedef struct {
 	enum METAPROG_CMD cmd;
 	char *payload;
+	guint32 payload_size;
 	guint delay;
 
 	MetaprogAccount *ma;
@@ -153,6 +155,39 @@ metaprog_util_free_chat(gpointer data)
 	MetaprogChat *chat = data;
 	g_free(chat->name);
 	g_free(chat);
+}
+
+static PurpleChat*
+metaprog_blist_find_chat_by_name(PurpleAccount *account, const char* name)
+{
+	g_return_val_if_fail(name != NULL, NULL);
+
+	PurpleChat *chat;
+	PurpleBlistNode *node, *group;
+	GHashTable *components;
+	gchar *chat_name;
+
+	PurpleBuddyList *blist = purple_get_blist();
+
+	g_return_val_if_fail(blist != NULL, NULL);
+
+	for (group = blist->root; group != NULL; group = group->next) {
+		for (node = group->child; node != NULL; node = node->next) {
+			if (PURPLE_BLIST_NODE_IS_CHAT(node)) {
+				chat = (PurpleChat*)node;
+
+				if (account != chat->account) continue;
+
+				components = purple_chat_get_components(chat);
+				gchar *chat_name = g_hash_table_lookup(components, "name");
+				if (!g_strcmp0(name, chat_name)) {
+					return chat;
+				}
+			}
+		}
+	}
+
+	return NULL;
 }
 
 
@@ -291,27 +326,57 @@ metaprog_get_chat_name(GHashTable *data)
 	return g_strdup(temp);
 }
 
-static int
-metaprog_send_msg(MetaprogAccount *ia, const gchar *to, const gchar *message)
+/*static void
+metaprog_get_chat_history(MetaprogAccount *ia, const gchar* chatId, const gchar* fromMsg, gint64 count, gpointer user_data)
 {
-	return 1;
-}	
+}*/
+
+static void
+metaprog_send_cmd(MetaprogAccount *ma, enum METAPROG_CMD cmd, gchar *payload, guint32 payload_size, guint delay)
+{
+	MetaprogCmdObject *co = g_new0(MetaprogCmdObject, 1);
+	co->cmd = cmd;
+	co->payload = payload;
+	co->payload_size = payload_size;
+	co->delay = delay;
+
+	co->ma = ma;
+
+	g_queue_push_head(ma->cmd_queue, co);
+}
 
 static int
-metaprog_send_im(PurpleConnection *pc,
-#if PURPLE_VERSION_CHECK(3, 0, 0)
-				PurpleMessage *msg)
+metaprog_send_msg(MetaprogAccount *ma, const gchar *to, const gchar *message)
 {
-	const gchar *who = purple_message_get_recipient(msg);
-	const gchar *message = purple_message_get_contents(msg);
-#else
-				const gchar *who, const gchar *message, PurpleMessageFlags flags)
-{
-#endif
-	
-	MetaprogAccount *ia = purple_connection_get_protocol_data(pc);
-	
-	return metaprog_send_msg(ia, who, message);
+	gchar *stripped = purple_markup_strip_html(message);
+
+	GError *error = NULL;
+	gchar *win = g_convert_with_fallback(stripped, -1, "Cp1251", "UTF-8", "?", NULL, NULL, &error);
+	g_free(stripped);
+
+	if (error != NULL) {
+		purple_debug_error("metaprog", error->message);
+		g_free(error);
+
+		return -1;
+	}
+
+	guint32 win_length = strlen(win);
+
+	guint32 msg_payload_size = 8 + win_length;
+	gchar *msg_payload = g_new(char, msg_payload_size);
+
+	metaprog_guint32_to_char(msg_payload, (guint32)g_ascii_strtoll(to, NULL, 10));
+
+	metaprog_guint32_to_char(msg_payload + 4, win_length);
+	memcpy(msg_payload + 8, win, win_length);
+
+	metaprog_send_cmd(ma, METAPROG_CMD_SEND_MESSAGE, msg_payload, msg_payload_size, 0);
+
+	g_free(win);
+
+	// due to the the async approach, we can't now for sure if the message was sent now :(
+	return 1;
 }
 
 static gint
@@ -325,34 +390,22 @@ const gchar *message, PurpleMessageFlags flags)
 {
 #endif
 	
-	MetaprogAccount *ia = purple_connection_get_protocol_data(pc);
+	MetaprogAccount *ma = purple_connection_get_protocol_data(pc);
 	PurpleChatConversation *chatconv = purple_conversations_find_chat(pc, id);
-	const gchar *sn = purple_conversation_get_data(PURPLE_CONVERSATION(chatconv), "sn");
+	const gchar *chat_name = purple_conversation_get_name(PURPLE_CONVERSATION(chatconv));
 	
-	if (!sn) {
-		sn = purple_conversation_get_name(PURPLE_CONVERSATION(chatconv));
-		g_return_val_if_fail(sn, -1);
-	}
-	
-	return metaprog_send_msg(ia, sn, message);
-}
+	g_return_val_if_fail(chat_name, -1);
 
-/*static void
-metaprog_get_chat_history(MetaprogAccount *ia, const gchar* chatId, const gchar* fromMsg, gint64 count, gpointer user_data)
-{
-}*/
+	PurpleChat *purple_chat = metaprog_blist_find_chat_by_name(ma->account, chat_name);
 
-static void
-metaprog_send_cmd(MetaprogAccount *ma, enum METAPROG_CMD cmd, gchar *payload, guint delay)
-{
-	MetaprogCmdObject *co = g_new0(MetaprogCmdObject, 1);
-	co->cmd = cmd;
-	co->payload = payload;
-	co->delay = delay;
+	g_return_val_if_fail(purple_chat, -1);
 
-	co->ma = ma;
+	GHashTable *components = purple_chat_get_components(purple_chat);
+	gchar *id_string = g_hash_table_lookup(components, "id");
 
-	g_queue_push_head(ma->cmd_queue, co);
+	g_return_val_if_fail(id_string, -1);
+
+	return metaprog_send_msg(ma, id_string, message);
 }
 
 static void
@@ -483,13 +536,13 @@ metaprog_socket_read_chats_list(guchar *buf, gssize size, MetaprogAccount *ma, G
 			g_free(name);
 		}
 
-		metaprog_send_cmd(ma, METAPROG_CMD_REQUEST_CHAT_UPDATE, chat_id_string, 0);
+		metaprog_send_cmd(ma, METAPROG_CMD_REQUEST_CHAT_UPDATE, chat_id_string, 4, 0);
 	}
 
 	g_hash_table_foreach(ma->chats_list, metaprog_populate_buddy_list, ma);
 
 	// delay the next query
-	metaprog_send_cmd(ma, METAPROG_CMD_REQUEST_CHATS, NULL, 1);
+	metaprog_send_cmd(ma, METAPROG_CMD_REQUEST_CHATS, NULL, 0, 1);
 }
 
 static void
@@ -638,6 +691,9 @@ metaprog_get_required_packet_size(MetaprogCmdObject *co, gchar* buf, guint size)
 
 		return metaprog_char_to_guint32(buf);
 	}
+	else if (co->cmd == METAPROG_CMD_SEND_MESSAGE) {
+		return 0;
+	}
 
 	// not enough information yet
 	return -1;
@@ -677,13 +733,13 @@ metaprog_socket_connect_callback(PurpleSocket *ps, const gchar *error, gpointer 
 			purple_debug_error("metaprog", "The socket has choked! Feed it carefully! %d %d\n", size, ma->auth_string_len);
 		}
 	}
-	if (co->cmd == METAPROG_CMD_REQUEST_CHAT_UPDATE) {
-		size = purple_socket_write(ps, co->payload, 4);
-		if (size != 4) {
+	if (co->cmd == METAPROG_CMD_REQUEST_CHAT_UPDATE || co->cmd == METAPROG_CMD_SEND_MESSAGE) {
+		size = purple_socket_write(ps, co->payload, co->payload_size);
+		if (size != co->payload_size) {
 			if (size == -1) {
 				purple_debug_error("metaprog", "Socket write error: %d\n", errno);
 			} else {
-				purple_debug_error("metaprog", "The socket has choked! Feed it carefully! %d %d\n", size, 4);
+				purple_debug_error("metaprog", "The socket has choked! Feed it carefully! %d %d\n", size, co->payload_size);
 			}
 		}
 	}
@@ -755,7 +811,7 @@ metaprog_socket_connect_callback(PurpleSocket *ps, const gchar *error, gpointer 
 			purple_debug_info("metaprog", "auth_result = %d\n", auth_result);
 
 			if (known_auth) {
-				metaprog_send_cmd(ma, METAPROG_CMD_REQUEST_CHATS, NULL, 0);
+				metaprog_send_cmd(ma, METAPROG_CMD_REQUEST_CHATS, NULL, 0, 0);
 			}
 		}
 		else if (co->cmd == METAPROG_CMD_REQUEST_CHATS) {
@@ -773,6 +829,9 @@ metaprog_socket_connect_callback(PurpleSocket *ps, const gchar *error, gpointer 
 				purple_debug_error("metaprog", error->message);
 				g_free(error);
 			}
+		}
+		else if (co->cmd == METAPROG_CMD_SEND_MESSAGE) {
+			// noop
 		}
 		else {
 			purple_debug_error("metaprog", "Unknown incoming data, please report this to developers:");
@@ -817,7 +876,7 @@ metaprog_session_start(MetaprogAccount *ma)
 		return;
 	}
 
-	metaprog_send_cmd(ma, METAPROG_CMD_PROBE, NULL, 0);
+	metaprog_send_cmd(ma, METAPROG_CMD_PROBE, NULL, 0, 0);
 	metaprog_next_cmd(ma);
 }
 
@@ -955,7 +1014,7 @@ plugin_init(PurplePlugin *plugin)
 	prpl_info->chat_info_defaults = metaprog_chat_info_defaults;
 	prpl_info->login = metaprog_login;
 	prpl_info->close = metaprog_close;
-	prpl_info->send_im = metaprog_send_im;
+	// prpl_info->send_im = metaprog_send_im;
 	// prpl_info->send_typing = metaprog_send_typing;
 	// prpl_info->join_chat = metaprog_join_chat;
 	prpl_info->get_chat_name = metaprog_get_chat_name;
@@ -1057,7 +1116,7 @@ metaprog_protocol_privacy_iface_init(PurpleProtocolPrivacyIface *prpl_info)
 static void 
 metaprog_protocol_im_iface_init(PurpleProtocolIMIface *prpl_info)
 {
-	prpl_info->send = metaprog_send_im;
+	// prpl_info->send = metaprog_send_im;
 	// prpl_info->send_typing = metaprog_send_typing;
 }
 
