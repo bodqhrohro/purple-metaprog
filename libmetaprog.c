@@ -60,7 +60,8 @@ enum METAPROG_CMD
 	METAPROG_CMD_PROBE = 0,
 	METAPROG_CMD_REQUEST_CHATS = 3,
 	METAPROG_CMD_SEND_MESSAGE = 4,
-	METAPROG_CMD_REQUEST_CHAT_UPDATE = 5,
+	METAPROG_CMD_REQUEST_CHAT_FULL = 5,
+	METAPROG_CMD_REQUEST_CHAT_UPDATE = 6,
 };
 
 
@@ -138,6 +139,7 @@ typedef struct {
 typedef struct {
 	gchar* name;
 	guint32 unread_count;
+	gboolean is_history_fetched;
 } MetaprogChat;
 
 
@@ -545,7 +547,11 @@ metaprog_socket_read_chats_list(guchar *buf, gssize size, MetaprogAccount *ma, G
 			g_free(name);
 		}
 
-		metaprog_send_cmd(ma, METAPROG_CMD_REQUEST_CHAT_UPDATE, chat_id_string, 4, 0);
+		metaprog_send_cmd(ma,
+			chat->is_history_fetched
+				? METAPROG_CMD_REQUEST_CHAT_UPDATE
+				: METAPROG_CMD_REQUEST_CHAT_FULL
+			, chat_id_string, 4, 0);
 	}
 
 	g_hash_table_foreach(ma->chats_list, metaprog_populate_buddy_list, ma);
@@ -694,6 +700,12 @@ metaprog_socket_read_chat_update(guchar *buf, gssize size, MetaprogAccount *ma, 
 
 		g_free(member_name);
 	}
+
+	gpointer chat_id_pointer = GUINT_TO_POINTER(chat_id);
+	MetaprogChat* chat = (MetaprogChat*)g_hash_table_lookup(ma->chats_list, chat_id_pointer);
+	if (!chat->is_history_fetched) {
+		chat->is_history_fetched = TRUE;
+	}
 }
 
 static guint32
@@ -701,7 +713,9 @@ metaprog_get_required_packet_size(MetaprogCmdObject *co, gchar* buf, guint size)
 	if (co->cmd == METAPROG_CMD_PROBE) {
 		return 10;
 	}
-	else if (co->cmd == METAPROG_CMD_REQUEST_CHATS || co->cmd == METAPROG_CMD_REQUEST_CHAT_UPDATE) {
+	else if (co->cmd == METAPROG_CMD_REQUEST_CHATS
+			|| co->cmd == METAPROG_CMD_REQUEST_CHAT_FULL
+			|| co->cmd == METAPROG_CMD_REQUEST_CHAT_UPDATE) {
 		if (size < 4) return -1;
 
 		return metaprog_char_to_guint32(buf);
@@ -748,7 +762,9 @@ metaprog_socket_connect_callback(PurpleSocket *ps, const gchar *error, gpointer 
 			purple_debug_error("metaprog", "The socket has choked! Feed it carefully! %d %d\n", size, ma->auth_string_len);
 		}
 	}
-	if (co->cmd == METAPROG_CMD_REQUEST_CHAT_UPDATE || co->cmd == METAPROG_CMD_SEND_MESSAGE) {
+	if (co->cmd == METAPROG_CMD_SEND_MESSAGE
+			|| co->cmd == METAPROG_CMD_REQUEST_CHAT_FULL
+			|| co->cmd == METAPROG_CMD_REQUEST_CHAT_UPDATE) {
 		size = purple_socket_write(ps, co->payload, co->payload_size);
 		if (size != co->payload_size) {
 			if (size == -1) {
@@ -837,7 +853,7 @@ metaprog_socket_connect_callback(PurpleSocket *ps, const gchar *error, gpointer 
 				g_free(error);
 			}
 		}
-		else if (co->cmd == METAPROG_CMD_REQUEST_CHAT_UPDATE) {
+		else if (co->cmd == METAPROG_CMD_REQUEST_CHAT_FULL || co->cmd == METAPROG_CMD_REQUEST_CHAT_UPDATE) {
 			metaprog_socket_read_chat_update(packet->data, packet->len, ma, metaprog_char_to_guint32(co->payload), &error);
 
 			if (error != NULL) {
