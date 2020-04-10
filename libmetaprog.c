@@ -43,6 +43,8 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 #define SERVER_ADDRESS "server-address"
 #define SERVER_PORT "server-port"
+#define LAST_MESSAGE "last-message"
+#define LAST_MESSAGE_INDEX "last-message-index"
 
 #define POLL_INTERVAL 10000
 #define POLL_TIMEOUT 60
@@ -140,6 +142,8 @@ typedef struct {
 	gchar* name;
 	guint32 unread_count;
 	gboolean is_history_fetched;
+	gchar* last_message_index_key;
+	gchar* last_message_key;
 } MetaprogChat;
 
 
@@ -155,6 +159,8 @@ static void
 metaprog_util_free_chat(gpointer data)
 {
 	MetaprogChat *chat = data;
+	g_free(chat->last_message_index_key);
+	g_free(chat->last_message_key);
 	g_free(chat->name);
 	g_free(chat);
 }
@@ -190,6 +196,20 @@ metaprog_blist_find_chat_by_name(PurpleAccount *account, const char* name)
 	}
 
 	return NULL;
+}
+
+static MetaprogChat *
+metaprog_chat_new(guint32 id)
+{
+	MetaprogChat *chat = g_new0(MetaprogChat, 1);
+	char *string_id = g_strdup_printf("%d", id);
+
+	chat->last_message_index_key = g_strjoin(NULL, LAST_MESSAGE_INDEX, string_id, NULL);
+	chat->last_message_key = g_strjoin(NULL, LAST_MESSAGE, string_id, NULL);
+
+	g_free(string_id);
+
+	return chat;
 }
 
 
@@ -534,7 +554,7 @@ metaprog_socket_read_chats_list(guchar *buf, gssize size, MetaprogAccount *ma, G
 		chat_id_pointer = GUINT_TO_POINTER(chat_id);
 		chat = (MetaprogChat*)g_hash_table_lookup(ma->chats_list, chat_id_pointer);
 		if (chat == NULL) {
-			chat = g_new0(MetaprogChat, 1);
+			chat = metaprog_chat_new(chat_id);
 			g_hash_table_insert(ma->chats_list, chat_id_pointer, chat);
 		}
 
@@ -625,7 +645,7 @@ metaprog_socket_read_chat_update(guchar *buf, gssize size, MetaprogAccount *ma, 
 		chat_data = PURPLE_CONV_CHAT(purple_conv);
 	}
 
-	// add new messages
+	// collect new messages
 	int i;
 
 	guint32 messages_count = metaprog_char_to_guint32(buf + offset);
@@ -645,6 +665,8 @@ metaprog_socket_read_chat_update(guchar *buf, gssize size, MetaprogAccount *ma, 
 	guint32 senders_count = metaprog_char_to_guint32(buf + offset);
 	offset += 4;
 
+	g_return_if_fail(messages_count == senders_count);
+
 	if (messages_count != senders_count) {
 		purple_connection_error(pc, PURPLE_CONNECTION_ERROR_OTHER_ERROR, _("Mismatch of messages and senders number, aborting"));
 		g_queue_free_full(messages, metaprog_util_free_gchar);
@@ -662,6 +684,40 @@ metaprog_socket_read_chat_update(guchar *buf, gssize size, MetaprogAccount *ma, 
 		g_queue_push_tail(senders, sender);
 	}
 
+	// history consistence check
+	gpointer chat_id_pointer = GUINT_TO_POINTER(chat_id);
+	MetaprogChat* chat = (MetaprogChat*)g_hash_table_lookup(ma->chats_list, chat_id_pointer);
+
+	guint new_history_size = g_queue_get_length(messages);
+
+	g_return_if_fail(new_history_size == messages_count);
+
+	if (chat != NULL && !chat->is_history_fetched) {
+		const char *last_msg = purple_account_get_string(ma->account, chat->last_message_key, NULL);
+		int last_msg_i = purple_account_get_int(ma->account, chat->last_message_index_key, -1);
+
+		if (last_msg_i > -1 && new_history_size >= last_msg_i) {
+			char *matching_last_msg = (char*)g_queue_peek_nth(messages, last_msg_i);
+			if (g_strcmp0(last_msg, matching_last_msg)) {
+				// something went wrong, ditch the history and show everything again
+				purple_debug_error("metaprog", _("History is broken or edited on the server, re-fetching competely\n"));
+				purple_account_set_int(ma->account, chat->last_message_index_key, -1);
+				purple_account_set_string(ma->account, chat->last_message_key, NULL);
+			} else {
+				// skip the already logged messages
+				purple_debug_info("metaprog", _("Skipping %d messages\n"), last_msg_i);
+
+				// the last message is intentionally left to keep context, so no <= here
+				for (int i = 0; i < last_msg_i; i ++) {
+					g_queue_pop_head(messages);
+					g_queue_pop_head(senders);
+				}
+			}
+		}
+	}
+
+	// show the new messages
+	gchar *last_new_msg = NULL;
 	for (;;) {
 		message = g_queue_pop_head(messages);
 		sender = g_queue_pop_head(senders);
@@ -670,9 +726,23 @@ metaprog_socket_read_chat_update(guchar *buf, gssize size, MetaprogAccount *ma, 
 
 		purple_serv_got_chat_in(pc, chat_id, sender, 0, message, time(NULL));
 
-		g_free(message);
+		g_free(last_new_msg);
+		last_new_msg = message;
+
 		g_free(sender);
 	}
+
+	g_queue_free(messages);
+	g_queue_free(senders);
+
+	// save the new history position
+	// (partial updates are not reliable, so they should be re-fetched on the next reconnect)
+	if (chat != NULL && !chat->is_history_fetched) {
+		purple_account_set_int(ma->account, chat->last_message_index_key, new_history_size-1);
+		purple_account_set_string(ma->account, chat->last_message_key, last_new_msg);
+	}
+
+	g_free(last_new_msg);
 
 	// update the room roster
 	guint32 members_count = metaprog_char_to_guint32(buf + offset);
@@ -701,9 +771,7 @@ metaprog_socket_read_chat_update(guchar *buf, gssize size, MetaprogAccount *ma, 
 		g_free(member_name);
 	}
 
-	gpointer chat_id_pointer = GUINT_TO_POINTER(chat_id);
-	MetaprogChat* chat = (MetaprogChat*)g_hash_table_lookup(ma->chats_list, chat_id_pointer);
-	if (!chat->is_history_fetched) {
+	if (chat != NULL && !chat->is_history_fetched && new_history_size > 0) {
 		chat->is_history_fetched = TRUE;
 	}
 }
