@@ -718,13 +718,16 @@ metaprog_socket_read_chat_update(guchar *buf, gssize size, MetaprogAccount *ma, 
 
 	// show the new messages
 	gchar *last_new_msg = NULL;
+	gchar *escaped_msg = NULL;
 	for (;;) {
 		message = g_queue_pop_head(messages);
 		sender = g_queue_pop_head(senders);
 
 		if (message == NULL) break;
 
-		purple_serv_got_chat_in(pc, chat_id, sender, 0, message, time(NULL));
+		char *escaped_msg = purple_markup_escape_text(message, -1);
+		purple_serv_got_chat_in(pc, chat_id, sender, 0, escaped_msg, time(NULL));
+		g_free(escaped_msg);
 
 		g_free(last_new_msg);
 		last_new_msg = message;
