@@ -598,11 +598,14 @@ metaprog_socket_read_chat_update(guchar *buf, gssize size, MetaprogAccount *ma, 
 
 	// pop the conversation or find the existing one
 	PurpleConversation *purple_conv = purple_find_conversation_with_account(PURPLE_CONV_TYPE_CHAT, name, ma->account);
+	PurpleConvChat *chat_data;
 	if (purple_conv == NULL) {
-		purple_conv = purple_conversation_new(PURPLE_CONV_TYPE_CHAT, ma->account, name);
+		chat_data = purple_serv_got_joined_chat(pc, chat_id, name);
+		purple_conv = purple_conv_chat_get_conversation(chat_data);
 		purple_conversation_present(purple_conv);
+	} else {
+		chat_data = PURPLE_CONV_CHAT(purple_conv);
 	}
-	PurpleConvChat *chat_data = purple_conversation_get_chat_data(purple_conv);
 
 	// add new messages
 	int i;
@@ -647,7 +650,7 @@ metaprog_socket_read_chat_update(guchar *buf, gssize size, MetaprogAccount *ma, 
 
 		if (message == NULL) break;
 
-		purple_conv_chat_write(chat_data, sender, message, PURPLE_MESSAGE_RECV, 0);
+		purple_serv_got_chat_in(pc, chat_id, sender, 0, message, time(NULL));
 
 		g_free(message);
 		g_free(sender);
