@@ -40,9 +40,15 @@ libmetaprog.so: $(PURPLE_C_FILES) $(PURPLE_COMPAT_FILES)
 libmetaprog3.so: $(PURPLE_C_FILES)
 	$(CC) -fPIC $(CFLAGS) -shared -o $@ $^ $(LDFLAGS) `$(PKG_CONFIG) purple-3 glib-2.0 json-glib-1.0 zlib --libs --cflags` -ldl $(INCLUDES) -g -ggdb
 
-install: $(METAPROG_TARGET)
+install: $(METAPROG_TARGET) install-icons
 	mkdir -p $(METAPROG_DEST)
 	install -p $(METAPROG_TARGET) $(METAPROG_DEST)
+
+install-icons: metaprog16.png metaprog32.png
+	mkdir -p $(METAPROG_ICONS_DEST)/16
+	mkdir -p $(METAPROG_ICONS_DEST)/32
+	install metaprog16.png $(METAPROG_ICONS_DEST)/16/metaprog.png
+	install metaprog32.png $(METAPROG_ICONS_DEST)/32/metaprog.png
 
 FAILNOPURPLE:
 	echo "You need libpurple development headers installed to be able to compile this plugin"
