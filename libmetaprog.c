@@ -346,7 +346,7 @@ metaprog_send_cmd(MetaprogAccount *ma, enum METAPROG_CMD cmd, gchar *payload, gu
 }
 
 static int
-metaprog_send_msg(MetaprogAccount *ma, const gchar *to, const gchar *message)
+metaprog_send_msg(MetaprogAccount *ma, guint32 id, const gchar *message)
 {
 	gchar *stripped = purple_markup_strip_html(message);
 
@@ -366,7 +366,7 @@ metaprog_send_msg(MetaprogAccount *ma, const gchar *to, const gchar *message)
 	guint32 msg_payload_size = 8 + win_length;
 	gchar *msg_payload = g_new(char, msg_payload_size);
 
-	metaprog_guint32_to_char(msg_payload, (guint32)g_ascii_strtoll(to, NULL, 10));
+	metaprog_guint32_to_char(msg_payload, id);
 
 	metaprog_guint32_to_char(msg_payload + 4, win_length);
 	memcpy(msg_payload + 8, win, win_length);
@@ -392,20 +392,29 @@ const gchar *message, PurpleMessageFlags flags)
 	
 	MetaprogAccount *ma = purple_connection_get_protocol_data(pc);
 	PurpleChatConversation *chatconv = purple_conversations_find_chat(pc, id);
-	const gchar *chat_name = purple_conversation_get_name(PURPLE_CONVERSATION(chatconv));
-	
-	g_return_val_if_fail(chat_name, -1);
+	PurpleConversation *conv = purple_conv_chat_get_conversation(chatconv);
 
-	PurpleChat *purple_chat = metaprog_blist_find_chat_by_name(ma->account, chat_name);
+	guint32 chat_id = GPOINTER_TO_UINT(purple_conversation_get_data(conv, "id"));
 
-	g_return_val_if_fail(purple_chat, -1);
+	if (!chat_id) {
+		// the chat's probably opened manually, falling back to a quirky way
+		const gchar *chat_name = purple_conversation_get_name(PURPLE_CONVERSATION(chatconv));
 
-	GHashTable *components = purple_chat_get_components(purple_chat);
-	gchar *id_string = g_hash_table_lookup(components, "id");
+		g_return_val_if_fail(chat_name, -1);
 
-	g_return_val_if_fail(id_string, -1);
+		PurpleChat *purple_chat = metaprog_blist_find_chat_by_name(ma->account, chat_name);
 
-	return metaprog_send_msg(ma, id_string, message);
+		g_return_val_if_fail(purple_chat, -1);
+
+		GHashTable *components = purple_chat_get_components(purple_chat);
+		gchar *id_string = g_hash_table_lookup(components, "id");
+
+		g_return_val_if_fail(id_string, -1);
+
+		chat_id = (guint32)g_ascii_strtoll(id_string, NULL, 10);
+	}
+
+	return metaprog_send_msg(ma, chat_id, message);
 }
 
 static void
@@ -602,7 +611,10 @@ metaprog_socket_read_chat_update(guchar *buf, gssize size, MetaprogAccount *ma, 
 	if (purple_conv == NULL) {
 		chat_data = purple_serv_got_joined_chat(pc, chat_id, name);
 		purple_conv = purple_conv_chat_get_conversation(chat_data);
+
 		purple_conversation_present(purple_conv);
+
+		purple_conversation_set_data(purple_conv, "id", GINT_TO_POINTER(chat_id));
 	} else {
 		chat_data = PURPLE_CONV_CHAT(purple_conv);
 	}
