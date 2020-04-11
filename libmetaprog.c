@@ -632,17 +632,26 @@ metaprog_socket_read_chat_update(guchar *buf, gssize size, MetaprogAccount *ma, 
 	g_free(new_name);
 
 	// pop the conversation or find the existing one
+	gpointer chat_id_pointer = GUINT_TO_POINTER(chat_id);
+	MetaprogChat* chat = (MetaprogChat*)g_hash_table_lookup(ma->chats_list, chat_id_pointer);
+
 	PurpleConversation *purple_conv = purple_find_conversation_with_account(PURPLE_CONV_TYPE_CHAT, name, ma->account);
 	PurpleConvChat *chat_data;
-	if (purple_conv == NULL) {
+
+	gboolean is_new_conversation = purple_conv == NULL ? TRUE : FALSE;
+
+	// resurrect the conversations on every reconnect
+	if (purple_conv == NULL || (chat != NULL && !chat->is_history_fetched)) {
 		chat_data = purple_serv_got_joined_chat(pc, chat_id, name);
 		purple_conv = purple_conv_chat_get_conversation(chat_data);
-
-		purple_conversation_present(purple_conv);
-
-		purple_conversation_set_data(purple_conv, "id", GINT_TO_POINTER(chat_id));
 	} else {
 		chat_data = PURPLE_CONV_CHAT(purple_conv);
+	}
+
+	purple_conversation_set_data(purple_conv, "id", GINT_TO_POINTER(chat_id));
+
+	if (is_new_conversation) {
+		purple_conversation_present(purple_conv);
 	}
 
 	// collect new messages
@@ -685,9 +694,6 @@ metaprog_socket_read_chat_update(guchar *buf, gssize size, MetaprogAccount *ma, 
 	}
 
 	// history consistence check
-	gpointer chat_id_pointer = GUINT_TO_POINTER(chat_id);
-	MetaprogChat* chat = (MetaprogChat*)g_hash_table_lookup(ma->chats_list, chat_id_pointer);
-
 	guint new_history_size = g_queue_get_length(messages);
 
 	g_return_if_fail(new_history_size == messages_count);
