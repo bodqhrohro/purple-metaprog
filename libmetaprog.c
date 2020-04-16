@@ -41,6 +41,8 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 #define BUF_SIZE 1024
 
+#define PLUGIN_VERSION "0.0.2-dev"
+
 #define SERVER_ADDRESS "server-address"
 #define SERVER_PORT "server-port"
 #define LAST_MESSAGE "last-message"
@@ -354,17 +356,22 @@ metaprog_get_chat_history(MetaprogAccount *ia, const gchar* chatId, const gchar*
 }*/
 
 static void
-metaprog_send_cmd(MetaprogAccount *ma, enum METAPROG_CMD cmd, gchar *payload, guint32 payload_size, guint delay)
+metaprog_send_cmd(MetaprogAccount *ma, enum METAPROG_CMD cmd, gchar *payload, guint32 payload_size, gint delay)
 {
 	MetaprogCmdObject *co = g_new0(MetaprogCmdObject, 1);
 	co->cmd = cmd;
 	co->payload = payload;
 	co->payload_size = payload_size;
-	co->delay = delay;
+	co->delay = (delay > 0) ? delay : 0;
 
 	co->ma = ma;
 
-	g_queue_push_head(ma->cmd_queue, co);
+	// negative delay means immediate
+	if (delay < 0) {
+		g_queue_push_tail(ma->cmd_queue, co);
+	} else {
+		g_queue_push_head(ma->cmd_queue, co);
+	}
 }
 
 static int
@@ -393,7 +400,7 @@ metaprog_send_msg(MetaprogAccount *ma, guint32 id, const gchar *message)
 	metaprog_guint32_to_char(msg_payload + 4, win_length);
 	memcpy(msg_payload + 8, win, win_length);
 
-	metaprog_send_cmd(ma, METAPROG_CMD_SEND_MESSAGE, msg_payload, msg_payload_size, 0);
+	metaprog_send_cmd(ma, METAPROG_CMD_SEND_MESSAGE, msg_payload, msg_payload_size, -1);
 
 	g_free(win);
 
@@ -492,7 +499,12 @@ metaprog_next_cmd(MetaprogAccount *ma)
 	if (co == NULL) return;
 
 	if (co->delay) {
-		purple_timeout_add_seconds(co->delay, metaprog_cmd_delay_callback, co);
+		if (co->delay % 1000) {
+			purple_timeout_add(co->delay, metaprog_cmd_delay_callback, co);
+		} else {
+			// that's better for timer grouping
+			purple_timeout_add_seconds(co->delay / 1000, metaprog_cmd_delay_callback, co);
+		}
 	} else {
 		metaprog_cmd_delay_callback(co);
 	}
@@ -571,13 +583,13 @@ metaprog_socket_read_chats_list(guchar *buf, gssize size, MetaprogAccount *ma, G
 			chat->is_history_fetched
 				? METAPROG_CMD_REQUEST_CHAT_UPDATE
 				: METAPROG_CMD_REQUEST_CHAT_FULL
-			, chat_id_string, 4, 0);
+			, chat_id_string, 4, 300);
 	}
 
 	g_hash_table_foreach(ma->chats_list, metaprog_populate_buddy_list, ma);
 
 	// delay the next query
-	metaprog_send_cmd(ma, METAPROG_CMD_REQUEST_CHATS, NULL, 0, 1);
+	metaprog_send_cmd(ma, METAPROG_CMD_REQUEST_CHATS, NULL, 0, 1000);
 }
 
 static void
@@ -1156,7 +1168,7 @@ static PurplePluginInfo info = {
 	PURPLE_PRIORITY_DEFAULT,		/* priority */
 	"prpl-bodqhrohro-metaprog",			/* id */
 	"Metaprog Online",					/* name */
-	"0.0.1",							/* version */
+	PLUGIN_VERSION,							/* version */
 	"",								/* summary */
 	"",								/* description */
 	"Bohdan Horbeshko <bodqhrohro@gmail.com>", /* author */
@@ -1309,7 +1321,7 @@ plugin_query(GError **error)
 	return purple_plugin_info_new(
 		"id",          "prpl-bodqhrohro-metaprog",
 		"name",        "Metaprog Online",
-		"version",     "0.0.1",
+		"version",     PLUGIN_VERSION,
 		"category",    N_("Protocol"),
 		"summary",     N_("Metaprog Online Plugin."),
 		"description", N_("Adds Metaprog Online support to libpurple."),
