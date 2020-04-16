@@ -45,11 +45,13 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 #define SERVER_ADDRESS "server-address"
 #define SERVER_PORT "server-port"
+#define CONNECTION_RETRY_NUMBER "connection-retry-number"
 #define LAST_MESSAGE "last-message"
 #define LAST_MESSAGE_INDEX "last-message-index"
 
-#define POLL_INTERVAL 10000
-#define POLL_TIMEOUT 60
+#define POLL_INTERVAL 10000 // µs
+#define POLL_TIMEOUT 60 // s
+#define CONNECTION_FAIL_RETRY_INTERVAL 5 // s
 
 enum METAPROG_CONNECTION
 {
@@ -124,6 +126,7 @@ typedef struct {
 	GQueue *cmd_queue;
 	gboolean connection_closed;
 	guint32 connection_state;
+	gint reconnect_threshold;
 
 	guchar *auth_string;
 	size_t auth_string_len;
@@ -818,16 +821,37 @@ metaprog_get_required_packet_size(MetaprogCmdObject *co, gchar* buf, guint size)
 }
 
 static void
+metaprog_retry_cmd(MetaprogCmdObject *co, const gchar *error)
+{
+	MetaprogAccount *ma = co->ma;
+
+	if (ma->connection_closed) return;
+
+	if (ma->reconnect_threshold == -1) {
+		ma->reconnect_threshold = purple_account_get_int(ma->account, CONNECTION_RETRY_NUMBER, 5);
+	}
+
+	if (--ma->reconnect_threshold < 0) {
+		PurpleConnection *pc = purple_socket_get_connection(ma->socket);
+		purple_connection_error(pc, PURPLE_CONNECTION_ERROR_AUTHENTICATION_FAILED, error);
+	} else {
+		purple_socket_destroy(ma->socket);
+		purple_timeout_add_seconds(CONNECTION_FAIL_RETRY_INTERVAL, metaprog_cmd_delay_callback, co);
+	}
+}
+
+static void
 metaprog_socket_connect_callback(PurpleSocket *ps, const gchar *error, gpointer user_data)
 {
+	MetaprogCmdObject *co = user_data;
+
 	if (error != NULL) {
-		PurpleConnection *pc = purple_socket_get_connection(ps);
-		purple_connection_error(pc, PURPLE_CONNECTION_ERROR_AUTHENTICATION_FAILED, error);
+		metaprog_retry_cmd(co, error);
 		return;
 	}
 
-	MetaprogCmdObject *co = user_data;
 	MetaprogAccount *ma = co->ma;
+	ma->reconnect_threshold = -1;
 
 	gssize size;
 
@@ -1010,6 +1034,7 @@ metaprog_login(PurpleAccount *account)
 	purple_connection_set_protocol_data(pc, ma);
 	ma->account = account;
 	ma->pc = pc;
+	ma->reconnect_threshold = -1;
 
 	ma->cmd_queue =	g_queue_new();
 
@@ -1096,6 +1121,9 @@ plugin_init(PurplePlugin *plugin)
 	prpl_info->protocol_options = g_list_append(prpl_info->protocol_options, opt);
 
 	opt = purple_account_option_int_new(_("Server port"), SERVER_PORT, 9090);
+	prpl_info->protocol_options = g_list_append(prpl_info->protocol_options, opt);
+
+	opt = purple_account_option_int_new(_("Connection retry number"), CONNECTION_RETRY_NUMBER, 5);
 	prpl_info->protocol_options = g_list_append(prpl_info->protocol_options, opt);
 
 	info = plugin->info;
