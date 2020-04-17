@@ -41,7 +41,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 #define BUF_SIZE 1024
 
-#define PLUGIN_VERSION "0.0.2-dev"
+#define PLUGIN_VERSION "0.0.2"
 
 #define SERVER_ADDRESS "server-address"
 #define SERVER_PORT "server-port"
