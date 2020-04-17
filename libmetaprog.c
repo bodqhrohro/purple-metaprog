@@ -53,6 +53,8 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #define POLL_TIMEOUT 60 // s
 #define CONNECTION_FAIL_RETRY_INTERVAL 5 // s
 
+#define EAGAIN_THRESHOLD 100
+
 enum METAPROG_CONNECTION
 {
 	METAPROG_CONNECTION_STATE_FAILURE = 1,
@@ -168,6 +170,13 @@ metaprog_util_free_chat(gpointer data)
 	g_free(chat->last_message_key);
 	g_free(chat->name);
 	g_free(chat);
+}
+
+static void
+metaprog_util_free_cmd_object(MetaprogCmdObject *co)
+{
+	g_free(co->payload);
+	g_free(co);
 }
 
 static PurpleChat*
@@ -832,8 +841,10 @@ metaprog_retry_cmd(MetaprogCmdObject *co, const gchar *error)
 	}
 
 	if (--ma->reconnect_threshold < 0) {
+		metaprog_util_free_cmd_object(co);
+
 		PurpleConnection *pc = purple_socket_get_connection(ma->socket);
-		purple_connection_error(pc, PURPLE_CONNECTION_ERROR_AUTHENTICATION_FAILED, error);
+		purple_connection_error(pc, PURPLE_CONNECTION_ERROR_OTHER_ERROR, error);
 	} else {
 		purple_socket_destroy(ma->socket);
 		purple_timeout_add_seconds(CONNECTION_FAIL_RETRY_INTERVAL, metaprog_cmd_delay_callback, co);
@@ -900,12 +911,20 @@ metaprog_socket_connect_callback(PurpleSocket *ps, const gchar *error, gpointer 
 	guint32 required_size = metaprog_get_required_packet_size(co, packet->data, 0);
 	gboolean successful_read = TRUE;
 
+	guint8 eagain_number = 0;
+
 	for (;;) {
 		while ((size = purple_socket_read(ps, buf, BUF_SIZE)) > 0) {
 			g_array_append_vals(packet, buf, size);
 		}
 
-		if (size < 0 && errno != EAGAIN) {
+		if (size == 0 && errno == EAGAIN) {
+			eagain_number++;
+		} else {
+			eagain_number = 0;
+		}
+
+		if ((size < 0 && errno != EAGAIN) || eagain_number > EAGAIN_THRESHOLD) {
 			purple_debug_error("metaprog", "errno = %d\n", errno);
 			successful_read = FALSE;
 			break;
@@ -983,18 +1002,22 @@ metaprog_socket_connect_callback(PurpleSocket *ps, const gchar *error, gpointer 
 				purple_debug_error("metaprog", "buf[%d] = %x\n", i, packet->data[i]);
 			}
 		}
+	} else {
+		metaprog_retry_cmd(co, _("Socket read failure"));
+		return;
 	}
 
 	g_array_free(packet, TRUE);
-
-	g_free(co->payload);
-	g_free(co);
 
 	if (!ma->connection_closed) {
 		purple_socket_destroy(ps);
 	}
 
-	metaprog_next_cmd(ma);
+	if (successful_read) {
+		metaprog_util_free_cmd_object(co);
+
+		metaprog_next_cmd(ma);
+	}
 }
 
 static void
@@ -1063,8 +1086,7 @@ metaprog_close(PurpleConnection *pc)
 
 	MetaprogCmdObject *co;
 	while ((co = g_queue_pop_tail(ma->cmd_queue)) != NULL) {
-		g_free(co->payload);
-		g_free(co);
+		metaprog_util_free_cmd_object(co);
 	}
 	g_queue_free(ma->cmd_queue);
 	
