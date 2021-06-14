@@ -647,13 +647,10 @@ metaprog_socket_read_chat_update(guchar *buf, gssize size, MetaprogAccount *ma, 
 	if (g_strcmp0(name, new_name)) {
 		g_hash_table_replace(components, "name", new_name);
 
-		// this will be freed instead
-		new_name = name;
-
 		name = g_hash_table_lookup(components, "name");
+	} else {
+		g_free(new_name);
 	}
-
-	g_free(new_name);
 
 	// pop the conversation or find the existing one
 	gpointer chat_id_pointer = GUINT_TO_POINTER(chat_id);
@@ -804,7 +801,7 @@ metaprog_socket_read_chat_update(guchar *buf, gssize size, MetaprogAccount *ma, 
 		g_free(member_name);
 	}
 
-	if (chat != NULL && !chat->is_history_fetched && new_history_size > 0) {
+	if (chat != NULL && !chat->is_history_fetched) {
 		chat->is_history_fetched = TRUE;
 	}
 }
